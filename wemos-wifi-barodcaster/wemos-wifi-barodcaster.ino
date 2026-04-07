@@ -192,9 +192,11 @@ void handleToggle() {
 
   if (config.flooding) {
     prepareBeaconTemplate();
+    wifi_promiscuous_enable(1);  // required for reliable raw frame injection
     Serial.println("Flooding ON  — SSID: " + String(config.target_ssid)
                    + "  ch: " + String(config.channel));
   } else {
+    wifi_promiscuous_enable(0);
     Serial.println("Flooding OFF");
   }
 
@@ -300,7 +302,6 @@ void handleRoot() {
       fetch('/toggle', {method: 'POST'}).then(() => refresh());
     }
 
-    setInterval(refresh, 2000);
     refresh();
   </script>
 </body>
@@ -351,6 +352,7 @@ void setup() {
   prepareBeaconTemplate();
 
   if (config.flooding) {
+    wifi_promiscuous_enable(1);
     Serial.println("Resuming flood on boot");
   }
 }
