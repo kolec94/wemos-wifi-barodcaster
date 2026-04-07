@@ -268,8 +268,12 @@ void handleRoot() {
   <script>
     function refresh() {
       fetch('/status').then(r => r.json()).then(d => {
-        document.getElementById('ssid').value    = d.ssid;
-        document.getElementById('channel').value = String(d.channel);
+        // Only update inputs when they don't have focus — prevents overwriting
+        // whatever the user is currently typing
+        const ssidEl = document.getElementById('ssid');
+        const chEl   = document.getElementById('channel');
+        if (document.activeElement !== ssidEl) ssidEl.value = d.ssid;
+        if (document.activeElement !== chEl)   chEl.value   = String(d.channel);
         const badge = document.getElementById('badge');
         const btn   = document.getElementById('toggleBtn');
         if (d.flooding) {
@@ -330,8 +334,10 @@ void setup() {
   EEPROM.begin(EEPROM_SIZE);
   loadConfig();
 
-  // Pure AP mode on the configured channel — no router connection
-  WiFi.mode(WIFI_AP);
+  // AP+STA mode — STA layer is needed for wifi_send_pkt_freedom to inject raw frames;
+  // WiFi.disconnect() ensures it never actually tries to associate with anything.
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect();
   WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
 
   Serial.println("Config AP : " + String(CONFIG_AP_SSID) + "  ch: " + String(config.channel));
