@@ -1,192 +1,144 @@
-# Wemos D1 Mini Lite - WiFi Multi-SSID Broadcaster
+# Wemos D1 Mini Lite - WiFi Beacon Flooder
 
-A WiFi broadcaster that boots as a self-contained open access point with a captive portal for configuration. No router required — connect directly to the device to manage the SSIDs it broadcasts.
+> **For use in controlled lab environments only.**
 
-## Features
+Floods a target WiFi channel with 802.11 beacon frames for a specified SSID. Each beacon is injected with a fresh random locally-administered MAC address, making the target SSID appear as many distinct access points and saturating the beacon space on that channel. Configured via a built-in captive portal web UI — no router needed.
 
-- **Zero-config access**: boots as an open AP with a captive portal, no router credentials needed
-- **Captive portal**: any device that connects is automatically redirected to the config page
-- **Multiple SSID Broadcasting**: add up to 10 SSIDs to rotate through
-- **Rapid Switching**: automatically switches between SSIDs every 5 seconds
-- **Web Configuration**: browser-based interface served directly from the device
-- **Persistent Storage**: configuration saved to EEPROM, survives power cycles
-- **Optional Password**: apply a shared password to all broadcast SSIDs, or leave open
+**Stack:** Arduino C/C++, ESP8266 raw packet injection (`wifi_send_pkt_freedom`), DNSServer, ESP8266WebServer, EEPROM
 
 ## How It Works
 
 ```mermaid
 flowchart TD
-    A[Power on Wemos D1 Mini] --> B[load config from EEPROM]
-    B --> C[WiFi.mode WIFI_AP]
-    C --> D[softAP: open SSID 'WifiBroadcaster']
-    D --> E[Start DNS server on port 53\nredirect all queries to 192.168.4.1]
-    E --> F[Start web server on port 80]
-    F --> G{SSIDs saved and\nbroadcasting enabled?}
-    G -->|Yes| H[Resume broadcasting\nfrom index 0]
-    G -->|No| I[Stay on 'WifiBroadcaster'\nwaiting for config]
-    H --> J[loop runs continuously]
-    I --> J
+    A[Power on Wemos D1 Mini] --> B[Load config from EEPROM\ntarget SSID, channel, flood state]
+    B --> C[WiFi.mode WIFI_AP\nsoftAP: open 'WifiBroadcaster'\non configured channel]
+    C --> D[Start DNS server\nredirect all queries → 192.168.4.1]
+    D --> E[Start web server port 80]
+    E --> F[prepareBeaconTemplate\nbuild 802.11 beacon frame\nwith target SSID + channel tag]
+    F --> G{flooding flag set\nin EEPROM?}
+    G -->|Yes| H[Resume flooding on boot]
+    G -->|No| I[Wait for user to\nstart via web UI]
+    H & I --> J[loop runs continuously]
 
-    J --> K[dnsServer.processNextRequest]
-    J --> L[server.handleClient]
-    J --> M{Broadcasting enabled\nand SSIDs > 0?}
+    J --> K{flooding = true?}
+    K -->|Yes| L[sendBeaconBurst\n50 x wifi_send_pkt_freedom\neach with fresh random MAC]
+    L --> K
+    K -->|No| M[dnsServer.processNextRequest]
+    L --> M
+    M --> N[server.handleClient]
+    N --> J
 
-    M -->|Yes| N{Switch interval\nelapsed?}
-    N -->|Yes| O[switchToNextSSID\nsoftAP with next SSID]
-    O --> N
-    N -->|No| K
-    M -->|No| K
-
-    L --> P{Web request received?}
-    P -->|GET /| Q[Serve HTML config page]
-    P -->|POST /add_ssid| R[Add SSID to EEPROM]
-    P -->|POST /remove_ssid| S[Remove SSID from EEPROM]
-    P -->|POST /set_password| T[Update shared password]
-    P -->|POST /toggle_broadcast| U{Enable or disable?}
-    U -->|Enable| V[switchToSSID 0\nstart cycling]
-    U -->|Disable| W[softAP: revert to\n'WifiBroadcaster']
-    P -->|POST /clear_all| X[Clear all SSIDs\nsoftAP: revert to\n'WifiBroadcaster']
-    P -->|GET /get_status| Y[Return JSON status]
-    P -->|Any other URL| Z[302 redirect to\nhttp://192.168.4.1/]
-
-    R & S & T --> AA[Save config to EEPROM]
-    AA --> K
+    N --> O{Request?}
+    O -->|GET /| P[Serve web UI]
+    O -->|GET /status| Q[Return JSON status]
+    O -->|POST /set_config| R[Update SSID + channel\nrebuild beacon template\nrestart softAP on new channel]
+    O -->|POST /toggle| S{Toggle flood state}
+    S -->|ON| T[prepareBeaconTemplate\nstart flooding]
+    S -->|OFF| U[Stop flooding]
+    O -->|Any other URL| V[302 → http://192.168.4.1/]
+    R & T & U --> W[Save to EEPROM]
 ```
+
+## Beacon Frame Structure
+
+Each injected frame is a standard 802.11 beacon:
+
+| Section | Size | Notes |
+|---------|------|-------|
+| MAC header | 24 bytes | Frame type = management/beacon; DA = broadcast; SA + BSSID = random per frame |
+| Beacon fixed fields | 12 bytes | Interval = 100 TUs; Capability = ESS |
+| Tag 0: SSID | 2 + n bytes | The configured target SSID |
+| Tag 1: Supported Rates | 10 bytes | 1, 2, 5.5, 11, 18, 24, 36, 54 Mbps |
+| Tag 3: DS Parameter Set | 3 bytes | Declares the configured channel |
+
+MAC addresses use locally-administered unicast format (bit 1 set, bit 0 clear in the first octet) and are re-randomised for every single frame.
 
 ## Hardware Requirements
 
-- Wemos D1 Mini Lite (ESP8266)
+- Wemos D1 Mini Lite (ESP8266 / ESP8285)
 - USB cable for programming and power
 
 ## Software Requirements
 
-- Arduino IDE (1.8.x or newer)
-- ESP8266 Board Package (includes `DNSServer`, `ESP8266WebServer`, `EEPROM`)
+- Arduino IDE 1.8.x or newer
+- ESP8266 Board Package 3.x (includes `user_interface.h` with `wifi_send_pkt_freedom`)
 
 ### Installing ESP8266 Board Package
 
-1. Open Arduino IDE
-2. Go to **File → Preferences**
-3. Add this URL to "Additional Board Manager URLs":
+1. Open Arduino IDE → **File → Preferences**
+2. Add to "Additional Board Manager URLs":
    ```
    http://arduino.esp8266.com/stable/package_esp8266com_index.json
    ```
-4. Go to **Tools → Board → Boards Manager**
-5. Search for "esp8266" and install the package by ESP8266 Community
+3. **Tools → Board → Boards Manager** → search "esp8266" → install
 
 ## Installation
 
-1. **Clone or download** this project to your computer
+1. Open `wifi_broadcaster.ino` in Arduino IDE
+2. **Tools → Board → ESP8266 Boards → LOLIN(WEMOS) D1 mini Lite**
+3. **Tools → Port** → select the Wemos port
+4. Upload (→)
 
-2. **Open the sketch**:
-   - Open `wifi_broadcaster.ino` in Arduino IDE
-
-3. **Select the board**:
-   - Go to **Tools → Board → ESP8266 Boards → LOLIN(WEMOS) D1 mini Lite**
-
-4. **Select the port**:
-   - Go to **Tools → Port** and select the port your Wemos is connected to
-
-5. **Upload**:
-   - Click the upload button (→)
-
-No credentials need to be edited in the code — everything is configured at runtime via the web UI.
+No credentials need editing — everything is configured at runtime.
 
 ## Usage
 
 ### First Time Setup
 
-1. **Power on** the Wemos D1 Mini Lite
-2. On your phone or laptop, scan for WiFi networks
-3. Connect to the open network **`WifiBroadcaster`**
-4. A captive portal prompt will appear automatically — tap it, or navigate to `http://192.168.4.1`
+1. Power on the device
+2. Connect to the open network **`WifiBroadcaster`**
+3. Captive portal redirects to the config UI (or navigate to `http://192.168.4.1`)
 
-### Configuring SSIDs
+### Configuration
 
-1. **Add SSIDs**:
-   - Enter an SSID name in the "Add New SSID" field and click **Add SSID**
-   - Repeat for each SSID you want to broadcast (max 10)
+| Field | Description |
+|-------|-------------|
+| **Target SSID** | The SSID name to flood (max 31 chars) |
+| **Channel** | WiFi channel to inject on (1–13) |
 
-2. **Set Password** (optional):
-   - Enter a password in the "Access Point Password" field and click **Set Password**
-   - Leave empty to keep all broadcast SSIDs open
-   - This password applies to all SSIDs in the list
+1. Enter the target SSID and select the channel
+2. Click **Save Config**
+3. Click **Start Flooding**
 
-3. **Start Broadcasting**:
-   - Click **Toggle Broadcasting** to start cycling through your SSIDs
-   - The device rotates every 5 seconds; the active SSID is highlighted in yellow
+The status badge changes from `STOPPED` → `FLOODING`. The device injects 50 beacon frames per loop iteration, each with a unique random MAC.
 
-4. **Manage the list**:
-   - Click **Remove** next to any SSID to delete it
-   - Click **Clear All SSIDs** to wipe the list and return to the `WifiBroadcaster` setup AP
+### Reconfiguring While Flooding
 
-### Accessing the Config Page After Broadcasting Starts
+The config AP (`WifiBroadcaster`) stays up on the same channel throughout. Connect to it and visit `192.168.4.1` to change settings or stop flooding at any time.
 
-Connect to whichever SSID the device is currently broadcasting. The captive portal DNS redirect is always active, so any HTTP request on that network will reach the config page at `192.168.4.1`.
+Flood state is persisted to EEPROM — the device resumes flooding on the last-used SSID/channel after a power cycle.
 
 ## Configuration Options
 
-### Changing the Default Setup SSID
+### Beacons Per Burst
 
-Edit line 18 in the code:
-
-```cpp
-const char* SETUP_SSID = "WifiBroadcaster";
-```
-
-### Changing the Switch Interval
+Controls how many frames are injected before the main loop yields for DNS/HTTP:
 
 ```cpp
-#define SWITCH_INTERVAL 5000  // milliseconds — 5000 = 5 seconds
+#define BEACONS_PER_BURST 50
 ```
 
-### Changing the Maximum SSID Count
+Higher values = more aggressive flooding but slightly less responsive web UI.
+
+### Default Setup AP Name
 
 ```cpp
-#define MAX_SSIDS 10
+const char* CONFIG_AP_SSID = "WifiBroadcaster";
 ```
 
-Increasing this uses more EEPROM space (each SSID slot is 32 bytes).
+### Default Channel (applied on first boot / EEPROM wipe)
 
-## Technical Details
+```cpp
+config.channel = 6;
+```
 
-### Network Architecture
+## Technical Notes
 
-The device operates in pure **`WIFI_AP`** mode at all times — it never connects to an external router.
+- `wifi_send_pkt_freedom()` injects raw 802.11 frames directly, bypassing the normal WiFi stack
+- The radio transmits on whichever channel `softAP` is configured to — `set_config` restarts the softAP when the channel changes to keep them in sync
+- The ESP8266 has a single radio; it cannot simultaneously flood one channel while accepting connections on a different channel. The config AP and the flood channel are always the same
+- `BEACONS_PER_BURST 50` injects roughly 50 frames per ms range depending on frame size and RF conditions
 
-| Component | Role |
-|-----------|------|
-| `WiFi.softAP()` | Creates the AP and controls the broadcasted SSID |
-| `DNSServer` | Resolves all DNS queries to `192.168.4.1` (captive portal trigger) |
-| `ESP8266WebServer` | Serves the config UI and API; unknown paths 302-redirect to `/` |
-| `EEPROM` | Persists the SSID list, password, and enabled state |
+## Legal Notice
 
-### Captive Portal Flow
-
-Most mobile OSes (Android, iOS, Windows) perform an HTTP probe on new networks. Because the DNS server resolves everything to `192.168.4.1`, the probe gets an unexpected response, which triggers the OS to pop up the captive portal dialog automatically.
-
-### Memory Layout (EEPROM)
-
-- **Total**: 512 bytes
-- SSIDs: 10 × 32 bytes = 320 bytes
-- Password: 64 bytes
-- Metadata (`ssid_count`, `enabled`): ~8 bytes
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| Captive portal dialog doesn't appear | Manually navigate to `http://192.168.4.1` |
-| SSIDs not rotating | Ensure at least one SSID is added and **Toggle Broadcasting** is on |
-| Config not saving | Check Serial Monitor (115200 baud) for "Configuration saved" |
-| Can't reach config page mid-broadcast | Connect to the currently-active SSID, then visit `http://192.168.4.1` |
-
-## Security Considerations
-
-- This device broadcasts WiFi networks — use responsibly and only in environments you control
-- Do not broadcast SSIDs that impersonate legitimate networks without explicit authorization
-- Intended for authorized testing, research, and educational demonstrations only
-
-## License
-
-Provided as-is for educational purposes.
+Beacon flooding disrupts the WiFi environment on the target channel for all nearby devices. **Only operate this device inside a properly RF-isolated lab.** Uncontrolled use violates FCC Part 15, Ofcom regulations, and equivalent rules in other jurisdictions.

