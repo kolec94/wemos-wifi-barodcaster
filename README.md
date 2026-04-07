@@ -1,15 +1,57 @@
 # Wemos D1 Mini Lite - WiFi Multi-SSID Broadcaster
 
-A WiFi broadcaster that rapidly switches between multiple SSIDs with a web-based configuration interface.
+A WiFi broadcaster that boots as a self-contained open access point with a captive portal for configuration. No router required — connect directly to the device to manage the SSIDs it broadcasts.
 
 ## Features
 
-- **Multiple SSID Broadcasting**: Add up to 10 SSIDs that the device will broadcast
-- **Rapid Switching**: Automatically switches between SSIDs every 5 seconds
-- **Web Configuration**: Easy-to-use web interface for managing SSIDs
-- **Persistent Storage**: Configurations saved to EEPROM
-- **Station Mode Access**: Connect to your existing WiFi to access the configuration panel
-- **Password Protection**: Optional password for the broadcast access points
+- **Zero-config access**: boots as an open AP with a captive portal, no router credentials needed
+- **Captive portal**: any device that connects is automatically redirected to the config page
+- **Multiple SSID Broadcasting**: add up to 10 SSIDs to rotate through
+- **Rapid Switching**: automatically switches between SSIDs every 5 seconds
+- **Web Configuration**: browser-based interface served directly from the device
+- **Persistent Storage**: configuration saved to EEPROM, survives power cycles
+- **Optional Password**: apply a shared password to all broadcast SSIDs, or leave open
+
+## How It Works
+
+```mermaid
+flowchart TD
+    A[Power on Wemos D1 Mini] --> B[load config from EEPROM]
+    B --> C[WiFi.mode WIFI_AP]
+    C --> D[softAP: open SSID 'WifiBroadcaster']
+    D --> E[Start DNS server on port 53\nredirect all queries to 192.168.4.1]
+    E --> F[Start web server on port 80]
+    F --> G{SSIDs saved and\nbroadcasting enabled?}
+    G -->|Yes| H[Resume broadcasting\nfrom index 0]
+    G -->|No| I[Stay on 'WifiBroadcaster'\nwaiting for config]
+    H --> J[loop runs continuously]
+    I --> J
+
+    J --> K[dnsServer.processNextRequest]
+    J --> L[server.handleClient]
+    J --> M{Broadcasting enabled\nand SSIDs > 0?}
+
+    M -->|Yes| N{Switch interval\nelapsed?}
+    N -->|Yes| O[switchToNextSSID\nsoftAP with next SSID]
+    O --> N
+    N -->|No| K
+    M -->|No| K
+
+    L --> P{Web request received?}
+    P -->|GET /| Q[Serve HTML config page]
+    P -->|POST /add_ssid| R[Add SSID to EEPROM]
+    P -->|POST /remove_ssid| S[Remove SSID from EEPROM]
+    P -->|POST /set_password| T[Update shared password]
+    P -->|POST /toggle_broadcast| U{Enable or disable?}
+    U -->|Enable| V[switchToSSID 0\nstart cycling]
+    U -->|Disable| W[softAP: revert to\n'WifiBroadcaster']
+    P -->|POST /clear_all| X[Clear all SSIDs\nsoftAP: revert to\n'WifiBroadcaster']
+    P -->|GET /get_status| Y[Return JSON status]
+    P -->|Any other URL| Z[302 redirect to\nhttp://192.168.4.1/]
+
+    R & S & T --> AA[Save config to EEPROM]
+    AA --> K
+```
 
 ## Hardware Requirements
 
@@ -19,7 +61,7 @@ A WiFi broadcaster that rapidly switches between multiple SSIDs with a web-based
 ## Software Requirements
 
 - Arduino IDE (1.8.x or newer)
-- ESP8266 Board Package
+- ESP8266 Board Package (includes `DNSServer`, `ESP8266WebServer`, `EEPROM`)
 
 ### Installing ESP8266 Board Package
 
@@ -39,159 +81,112 @@ A WiFi broadcaster that rapidly switches between multiple SSIDs with a web-based
 2. **Open the sketch**:
    - Open `wifi_broadcaster.ino` in Arduino IDE
 
-3. **Configure your router credentials**:
-   - Edit lines 24-25 in the code:
-   ```cpp
-   const char* sta_ssid = "YOUR_ROUTER_SSID";
-   const char* sta_password = "YOUR_ROUTER_PASSWORD";
-   ```
-   Replace with your actual WiFi network credentials
-
-4. **Select the board**:
+3. **Select the board**:
    - Go to **Tools → Board → ESP8266 Boards → LOLIN(WEMOS) D1 mini Lite**
 
-5. **Select the port**:
+4. **Select the port**:
    - Go to **Tools → Port** and select the port your Wemos is connected to
 
-6. **Upload**:
+5. **Upload**:
    - Click the upload button (→)
+
+No credentials need to be edited in the code — everything is configured at runtime via the web UI.
 
 ## Usage
 
 ### First Time Setup
 
 1. **Power on** the Wemos D1 Mini Lite
-2. **Check Serial Monitor** (115200 baud) to see the device's IP address
-3. The device will connect to your router and display its IP address
-
-### Accessing the Web Interface
-
-1. **Connect** your computer to the same WiFi network as the Wemos
-2. **Open a web browser** and navigate to the IP address shown in Serial Monitor
-   - Example: `http://192.168.1.100`
+2. On your phone or laptop, scan for WiFi networks
+3. Connect to the open network **`WifiBroadcaster`**
+4. A captive portal prompt will appear automatically — tap it, or navigate to `http://192.168.4.1`
 
 ### Configuring SSIDs
 
 1. **Add SSIDs**:
-   - Enter an SSID name in the "Add New SSID" field
-   - Click "Add SSID"
+   - Enter an SSID name in the "Add New SSID" field and click **Add SSID**
    - Repeat for each SSID you want to broadcast (max 10)
 
-2. **Set Password** (Optional):
-   - Enter a password in the "Access Point Password" field
-   - Click "Set Password"
-   - Leave empty for open networks
-   - This password applies to ALL broadcast SSIDs
+2. **Set Password** (optional):
+   - Enter a password in the "Access Point Password" field and click **Set Password**
+   - Leave empty to keep all broadcast SSIDs open
+   - This password applies to all SSIDs in the list
 
 3. **Start Broadcasting**:
-   - Click "Toggle Broadcasting" to start/stop
-   - The device will cycle through all SSIDs every 5 seconds
+   - Click **Toggle Broadcasting** to start cycling through your SSIDs
+   - The device rotates every 5 seconds; the active SSID is highlighted in yellow
 
-4. **Remove SSIDs**:
-   - Click the "Remove" button next to any SSID to delete it
+4. **Manage the list**:
+   - Click **Remove** next to any SSID to delete it
+   - Click **Clear All SSIDs** to wipe the list and return to the `WifiBroadcaster` setup AP
 
-5. **Clear All**:
-   - Click "Clear All SSIDs" to remove all configured SSIDs
+### Accessing the Config Page After Broadcasting Starts
 
-### Web Interface Features
-
-- **Status Display**: Shows current broadcasting status, active SSID, and total count
-- **Real-time Updates**: Interface updates every 2 seconds
-- **Current SSID Highlight**: The currently broadcasting SSID is highlighted in yellow
-- **Broadcasting Toggle**: Start/stop broadcasting with one click
+Connect to whichever SSID the device is currently broadcasting. The captive portal DNS redirect is always active, so any HTTP request on that network will reach the config page at `192.168.4.1`.
 
 ## Configuration Options
 
-### Changing Switch Interval
+### Changing the Default Setup SSID
 
-To change how often the SSIDs switch, edit line 18 in the code:
-
-```cpp
-#define SWITCH_INTERVAL 5000  // Time in milliseconds (5000 = 5 seconds)
-```
-
-For example:
-- `3000` = 3 seconds
-- `10000` = 10 seconds
-- `30000` = 30 seconds
-
-### Changing Maximum SSIDs
-
-To change the maximum number of SSIDs, edit line 16:
+Edit line 18 in the code:
 
 ```cpp
-#define MAX_SSIDS 10  // Maximum number of SSIDs
+const char* SETUP_SSID = "WifiBroadcaster";
 ```
 
-**Note**: Increasing this value will use more EEPROM space.
+### Changing the Switch Interval
 
-## Troubleshooting
+```cpp
+#define SWITCH_INTERVAL 5000  // milliseconds — 5000 = 5 seconds
+```
 
-### Cannot Connect to Web Interface
+### Changing the Maximum SSID Count
 
-1. Check Serial Monitor (115200 baud) for the IP address
-2. Ensure your computer is on the same WiFi network
-3. Try restarting the Wemos
+```cpp
+#define MAX_SSIDS 10
+```
 
-### SSIDs Not Broadcasting
-
-1. Make sure you've added at least one SSID
-2. Click "Toggle Broadcasting" to enable
-3. Check Serial Monitor for error messages
-
-### Configuration Not Saving
-
-1. The configuration should save automatically
-2. Try power cycling the device
-3. Check Serial Monitor for "Configuration saved" messages
-
-### Device Not Connecting to WiFi
-
-1. Verify your router credentials in the code
-2. Check that your router is on and accessible
-3. Ensure the WiFi network is 2.4GHz (ESP8266 doesn't support 5GHz)
+Increasing this uses more EEPROM space (each SSID slot is 32 bytes).
 
 ## Technical Details
 
-### How It Works
+### Network Architecture
 
-1. The device boots and connects to your existing WiFi network in **Station mode**
-2. A web server runs on the Station connection for configuration
-3. When broadcasting is enabled, the device switches to **AP+STA mode**
-4. Every 5 seconds, it stops the current AP and starts a new one with the next SSID
-5. All configurations are stored in EEPROM for persistence
+The device operates in pure **`WIFI_AP`** mode at all times — it never connects to an external router.
 
-### Memory Usage
+| Component | Role |
+|-----------|------|
+| `WiFi.softAP()` | Creates the AP and controls the broadcasted SSID |
+| `DNSServer` | Resolves all DNS queries to `192.168.4.1` (captive portal trigger) |
+| `ESP8266WebServer` | Serves the config UI and API; unknown paths 302-redirect to `/` |
+| `EEPROM` | Persists the SSID list, password, and enabled state |
 
-- **EEPROM**: 512 bytes total
-  - SSIDs: 10 × 32 bytes = 320 bytes
-  - Password: 64 bytes
-  - Metadata: ~8 bytes
+### Captive Portal Flow
 
-### Network Modes
+Most mobile OSes (Android, iOS, Windows) perform an HTTP probe on new networks. Because the DNS server resolves everything to `192.168.4.1`, the probe gets an unexpected response, which triggers the OS to pop up the captive portal dialog automatically.
 
-- **Station Mode (STA)**: Connected to your router - for web configuration access
-- **Access Point Mode (AP)**: Broadcasting SSIDs
-- **AP+STA Mode**: Both simultaneously - broadcasts SSIDs while staying connected to router
+### Memory Layout (EEPROM)
 
-## Example Use Cases
+- **Total**: 512 bytes
+- SSIDs: 10 × 32 bytes = 320 bytes
+- Password: 64 bytes
+- Metadata (`ssid_count`, `enabled`): ~8 bytes
 
-- Testing WiFi roaming behavior
-- Creating a WiFi honeypot for security research
-- Simulating multiple access points
-- Educational demonstrations of WiFi networks
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Captive portal dialog doesn't appear | Manually navigate to `http://192.168.4.1` |
+| SSIDs not rotating | Ensure at least one SSID is added and **Toggle Broadcasting** is on |
+| Config not saving | Check Serial Monitor (115200 baud) for "Configuration saved" |
+| Can't reach config page mid-broadcast | Connect to the currently-active SSID, then visit `http://192.168.4.1` |
 
 ## Security Considerations
 
-- This device broadcasts WiFi networks - use responsibly
-- Set a strong password to prevent unauthorized access
-- Don't broadcast SSIDs that impersonate legitimate networks without authorization
-- Use only for authorized testing and educational purposes
+- This device broadcasts WiFi networks — use responsibly and only in environments you control
+- Do not broadcast SSIDs that impersonate legitimate networks without explicit authorization
+- Intended for authorized testing, research, and educational demonstrations only
 
 ## License
 
-This project is provided as-is for educational purposes.
-
-## Credits
-
-Built for ESP8266 (Wemos D1 Mini Lite) using Arduino framework.
+Provided as-is for educational purposes.

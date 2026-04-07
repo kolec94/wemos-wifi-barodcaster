@@ -2,14 +2,15 @@
  * Wemos D1 Mini Lite - WiFi Multi-SSID Broadcaster
  *
  * Features:
- * - Connects to existing WiFi (Station mode)
- * - Hosts web server for configuration
- * - Rapidly switches between multiple broadcast SSIDs
+ * - Boots as open AP with captive portal for configuration
+ * - Captive portal redirects all connections to the config web UI
+ * - Rotates through multiple broadcast SSIDs configured via the web UI
  * - Persistent storage of SSIDs in EEPROM
  */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <DNSServer.h>
 #include <EEPROM.h>
 
 // Configuration
@@ -17,12 +18,13 @@
 #define SSID_LENGTH 32
 #define SWITCH_INTERVAL 5000  // Switch SSID every 5 seconds
 #define EEPROM_SIZE 512
+#define DNS_PORT 53
 
-// Station mode credentials (change these to your router's credentials)
-const char* sta_ssid = "GL-SFT12000-c18";
-const char* sta_password = "goodlife";
+// Default open AP SSID used for initial setup / when no SSIDs are configured
+const char* SETUP_SSID = "WifiBroadcaster";
 
-// Web server
+// DNS and web server
+DNSServer dnsServer;
 ESP8266WebServer server(80);
 
 // SSID storage
@@ -40,33 +42,46 @@ unsigned long last_switch_time = 0;
 void setup() {
   Serial.begin(115200);
   delay(100);
-
   Serial.println("\n\nWemos WiFi Broadcaster Starting...");
 
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
   loadConfig();
 
-  // Connect to WiFi in Station mode
-  connectToWiFi();
+  // Pure AP mode - no router connection required
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(SETUP_SSID);  // Open network, no password
+
+  IPAddress apIP(192, 168, 4, 1);
+  Serial.print("AP IP address: ");
+  Serial.println(apIP);
+  Serial.print("Connect to open network: ");
+  Serial.println(SETUP_SSID);
+
+  // Start DNS server - redirect all DNS queries to this device (captive portal)
+  dnsServer.start(DNS_PORT, "*", apIP);
 
   // Setup web server routes
   setupWebServer();
 
   // Start web server
   server.begin();
-  Serial.println("Web server started");
-  Serial.print("Access at: http://");
-  Serial.println(WiFi.localIP());
+  Serial.println("Web server started at http://192.168.4.1");
+
+  // Resume broadcasting if it was active before power-off
+  if (config.enabled && config.ssid_count > 0) {
+    switchToSSID(0);
+    last_switch_time = millis();
+  }
 }
 
 void loop() {
+  dnsServer.processNextRequest();
   server.handleClient();
 
   // Handle SSID switching if enabled
   if (config.enabled && config.ssid_count > 0) {
     unsigned long current_time = millis();
-
     if (current_time - last_switch_time >= SWITCH_INTERVAL) {
       switchToNextSSID();
       last_switch_time = current_time;
@@ -74,39 +89,8 @@ void loop() {
   }
 }
 
-void connectToWiFi() {
-  Serial.print("Connecting to ");
-  Serial.println(sta_ssid);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(sta_ssid, sta_password);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nConnected to WiFi!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\nFailed to connect to WiFi");
-  }
-}
-
-void switchToNextSSID() {
-  if (config.ssid_count == 0) return;
-
-  // Stop current AP
-  WiFi.softAPdisconnect(true);
-
-  // Move to next SSID
-  current_ssid_index = (current_ssid_index + 1) % config.ssid_count;
-
-  // Start AP with new SSID
+void switchToSSID(int index) {
+  current_ssid_index = index % config.ssid_count;
   String ssid = String(config.ssids[current_ssid_index]);
 
   Serial.print("Broadcasting SSID: ");
@@ -117,13 +101,15 @@ void switchToNextSSID() {
   } else {
     WiFi.softAP(ssid.c_str());
   }
+}
 
-  // Set to both Station and AP mode
-  WiFi.mode(WIFI_AP_STA);
+void switchToNextSSID() {
+  if (config.ssid_count == 0) return;
+  switchToSSID((current_ssid_index + 1) % config.ssid_count);
 }
 
 void setupWebServer() {
-  // Main page
+  // Main config page
   server.on("/", handleRoot);
 
   // API endpoints
@@ -134,8 +120,10 @@ void setupWebServer() {
   server.on("/get_status", HTTP_GET, handleGetStatus);
   server.on("/clear_all", HTTP_POST, handleClearAll);
 
+  // Captive portal: redirect all unrecognised URLs to the config page
   server.onNotFound([]() {
-    server.send(404, "text/plain", "Not Found");
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "");
   });
 }
 
@@ -256,7 +244,7 @@ void handleRoot() {
 
         <h2>Broadcast SSIDs</h2>
         <div class="info">
-            The broadcaster will rotate through all SSIDs below every 5 seconds
+            Add the SSIDs you want to broadcast below. The device will rotate through them every 5 seconds.
         </div>
 
         <ul id="ssid-list" class="ssid-list">
@@ -471,13 +459,13 @@ void handleToggleBroadcast() {
   config.enabled = !config.enabled;
 
   if (config.enabled && config.ssid_count > 0) {
-    current_ssid_index = 0;
-    switchToNextSSID();
+    switchToSSID(0);
+    last_switch_time = millis();
     Serial.println("Broadcasting enabled");
   } else {
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
-    Serial.println("Broadcasting disabled");
+    // Revert to the default open setup SSID
+    WiFi.softAP(SETUP_SSID);
+    Serial.println("Broadcasting disabled, reverted to: " + String(SETUP_SSID));
   }
 
   saveConfig();
@@ -489,12 +477,12 @@ void handleClearAll() {
   config.enabled = false;
   current_ssid_index = 0;
 
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
+  // Revert to the default open setup SSID
+  WiFi.softAP(SETUP_SSID);
 
   saveConfig();
   server.send(200, "text/plain", "All SSIDs cleared");
-  Serial.println("All SSIDs cleared");
+  Serial.println("All SSIDs cleared, reverted to: " + String(SETUP_SSID));
 }
 
 void saveConfig() {
