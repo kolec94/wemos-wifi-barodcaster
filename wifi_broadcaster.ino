@@ -330,11 +330,24 @@ void handleRoot() {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body
-      }).then(() => refresh());
+      });
     }
 
     function toggle() {
-      fetch('/toggle', {method: 'POST'}).then(() => refresh());
+      fetch('/toggle', {method: 'POST'})
+        .then(r => r.text())
+        .then(state => {
+          const flooding = state === 'started';
+          const badge = document.getElementById('badge');
+          const btn   = document.getElementById('toggleBtn');
+          if (flooding) {
+            badge.textContent = 'FLOODING'; badge.className = 'badge on';
+            btn.textContent   = 'Stop Flooding';
+          } else {
+            badge.textContent = 'STOPPED';  badge.className = 'badge off';
+            btn.textContent   = 'Start Flooding';
+          }
+        });
     }
 
     refresh();
