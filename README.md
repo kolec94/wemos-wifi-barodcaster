@@ -2,7 +2,7 @@
 
 > **For use in controlled lab environments only.**
 
-Floods a target WiFi channel with 802.11 beacon frames for a specified SSID. Each beacon is injected with a fresh random locally-administered MAC address, making the target SSID appear as many distinct access points and saturating the beacon space on that channel. Configured via a built-in captive portal web UI — no router needed.
+Floods a target WiFi channel with 802.11 beacon frames for a specified SSID. Each beacon is injected with a fresh random locally-administered MAC address **and** a unique non-printable byte suffix appended to the SSID, so every frame has a distinct SSID byte-sequence and bypasses scanner deduplication. Configured via a built-in captive portal web UI — no router needed.
 
 **Stack:** Arduino C/C++, ESP8266 raw packet injection (`wifi_send_pkt_freedom`), DNSServer, ESP8266WebServer, EEPROM
 
@@ -10,19 +10,19 @@ Floods a target WiFi channel with 802.11 beacon frames for a specified SSID. Eac
 
 ```mermaid
 flowchart TD
-    A[Power on Wemos D1 Mini] --> B[Load config from EEPROM\ntarget SSID, channel, flood state]
+    A[Power on Wemos D1 Mini] --> B[Load config from EEPROM\ntarget SSID, channel, burst size, flood state]
     B --> C[WiFi.mode WIFI_AP_STA\nWiFi.disconnect — STA active\nbut never associates]
     C --> D[softAP: open 'WifiBroadcaster'\non configured channel]
     D --> E[Start DNS server\nredirect all queries → 192.168.4.1]
     E --> F[Start web server port 80]
-    F --> G[prepareBeaconTemplate\nbuild 802.11 beacon frame\nwith target SSID + channel tag]
+    F --> G[prepareBeaconTemplate\nvalidate SSID, set ready flag]
     G --> H{flooding flag\nset in EEPROM?}
     H -->|Yes| I[wifi_promiscuous_enable 1\nResume flooding on boot]
     H -->|No| J[Wait for user\nvia web UI]
     I & J --> K[loop runs continuously]
 
     K --> L{flooding = true?}
-    L -->|Yes| M[sendBeaconBurst\n50 x wifi_send_pkt_freedom\nfresh random MAC per frame]
+    L -->|Yes| M[sendBeaconBurst\nN x wifi_send_pkt_freedom\nrandom MAC + non-printable SSID suffix\nper frame]
     M --> L
     L -->|No| N[dnsServer.processNextRequest]
     M --> N
@@ -30,9 +30,9 @@ flowchart TD
     O --> K
 
     O --> P{Request?}
-    P -->|GET /| Q[Serve web UI\nno auto-refresh polling]
-    P -->|GET /status| R[Return JSON status]
-    P -->|POST /set_config| S[Update SSID + channel\nrebuild beacon template\nrestart softAP on new channel]
+    P -->|GET /| Q[Serve web UI\nloads once on connect]
+    P -->|GET /status| R[Return JSON\nssid, channel, burst_size, flooding]
+    P -->|POST /set_config| S[Update SSID, channel, burst size\nrebuild beacon template\nrestart softAP on new channel]
     P -->|POST /toggle| T{New flood state?}
     T -->|ON| U[prepareBeaconTemplate\nwifi_promiscuous_enable 1\nstart flooding]
     T -->|OFF| V[wifi_promiscuous_enable 0\nstop flooding]
@@ -42,17 +42,19 @@ flowchart TD
 
 ## Beacon Frame Structure
 
-Each injected frame is a standard 802.11 management beacon:
+Each injected frame is a standard 802.11 management beacon assembled fresh per frame:
 
 | Section | Size | Notes |
 |---------|------|-------|
 | MAC header | 24 bytes | Frame type = management/beacon; DA = broadcast; SA + BSSID = random per frame |
 | Beacon fixed fields | 12 bytes | Interval = 100 TUs; Capability = ESS + short preamble |
-| Tag 0: SSID | 2 + n bytes | The configured target SSID |
+| Tag 0: SSID | 2 + n bytes | Target SSID + 1–4 random non-printable bytes (0x01–0x1F) |
 | Tag 1: Supported Rates | 10 bytes | 1, 2, 5.5, 11, 18, 24, 36, 54 Mbps |
 | Tag 3: DS Parameter Set | 3 bytes | Declares the configured channel |
 
-MAC addresses use locally-administered unicast format (bit 1 set, bit 0 clear in the first octet) and are re-randomised for every single frame.
+The non-printable suffix makes each frame's SSID byte-sequence unique, bypassing deduplication in scanners that group by exact bytes. The variable SSID length means the full frame is assembled fresh on every injection — the pre-built template is just a ready flag, not a static buffer.
+
+MAC addresses use locally-administered unicast format (bit 1 set, bit 0 clear in the first octet) and are re-randomised for every frame.
 
 ## Hardware Requirements
 
@@ -92,20 +94,26 @@ No credentials need editing — everything is configured at runtime.
 
 ### Configuration
 
-| Field | Description |
-|-------|-------------|
-| **Target SSID** | The SSID name to flood (max 31 chars) |
-| **Channel** | WiFi channel to inject on (1–13) |
+| Field | Options | Description |
+|-------|---------|-------------|
+| **Target SSID** | any string, max 31 chars | The base SSID name to flood |
+| **Channel** | 1–13 | WiFi channel to inject on |
+| **SSID Count Per Burst** | 10 / 25 / 50 / 100 / 200 / 500 | Unique frames injected per loop iteration |
 
-1. Enter the target SSID and select the channel
-2. Click **Save Config**
-3. Click **Start Flooding**
+1. Enter the target SSID, select the channel and burst size
+2. Click **Save Config** — fires and forgets, inputs stay as-is
+3. Click **Start Flooding** — badge flips to `FLOODING` immediately
 
-The status badge changes from `STOPPED` → `FLOODING`. The device injects 50 beacon frames per loop iteration, each with a unique random MAC.
+### UI Behaviour
+
+- The page fetches saved config once on load to populate the fields
+- **Save** posts the config silently — no page update, no flicker
+- **Toggle** reads the server response and updates the badge and button text in-place
+- There is no background polling
 
 ### Verifying the Flood
 
-The phone's built-in WiFi settings deduplicate entries by SSID name — they will always show one row regardless of how many BSSIDs are broadcasting. To see the individual injected frames you need a tool that displays BSSIDs directly:
+The phone's built-in WiFi settings deduplicate by SSID name — they will always show one row. To see individual injected frames use a tool that displays BSSIDs:
 
 | Tool | Platform |
 |------|----------|
@@ -116,21 +124,9 @@ The phone's built-in WiFi settings deduplicate entries by SSID name — they wil
 
 ### Reconfiguring While Flooding
 
-The config AP (`WifiBroadcaster`) stays up on the same channel throughout. Connect to it and visit `192.168.4.1` to change settings or stop flooding. The web UI updates only on page load and after user actions — there is no background polling.
-
-Flood state is persisted to EEPROM — the device resumes flooding on the last-used SSID/channel after a power cycle.
+The config AP (`WifiBroadcaster`) stays up on the same channel throughout. Connect to it and visit `192.168.4.1` to change settings or stop flooding at any time. Config and flood state persist across power cycles — the device resumes on reboot.
 
 ## Configuration Options
-
-### Beacons Per Burst
-
-Controls how many frames are injected before the main loop yields for DNS/HTTP:
-
-```cpp
-#define BEACONS_PER_BURST 50
-```
-
-Higher values = more aggressive flooding but slightly less responsive web UI.
 
 ### Default Setup AP Name
 
@@ -138,11 +134,18 @@ Higher values = more aggressive flooding but slightly less responsive web UI.
 const char* CONFIG_AP_SSID = "WifiBroadcaster";
 ```
 
-### Default Channel (applied on first boot / EEPROM wipe)
+### Defaults applied on first boot or EEPROM wipe (magic byte `0xAC`)
 
 ```cpp
-config.channel = 6;
+config.target_ssid = "TargetSSID";
+config.channel     = 6;
+config.burst_size  = 50;
+config.flooding    = false;
 ```
+
+### Burst Size
+
+Set via the **SSID Count Per Burst** dropdown in the UI. Higher values flood more aggressively but reduce web UI responsiveness. 50–100 is a good balance for most lab scenarios.
 
 ## Technical Notes
 
@@ -152,13 +155,13 @@ The device runs in `WIFI_AP_STA` mode. `WIFI_AP` alone suppresses raw frame inje
 
 ### Promiscuous Mode
 
-`wifi_promiscuous_enable(1)` is called when flooding starts and `wifi_promiscuous_enable(0)` when it stops. Enabling promiscuous mode bypasses the SDK's normal receive filter, which is required for `wifi_send_pkt_freedom` to inject frames reliably on NONOSDK 22x.
+`wifi_promiscuous_enable(1)` is called when flooding starts and `wifi_promiscuous_enable(0)` when it stops. This bypasses the SDK's normal receive filter, which is required for `wifi_send_pkt_freedom` to inject frames reliably on NONOSDK 22x.
 
 ### Call Chain
 
 ```
-wifi_send_pkt_freedom()   — libmain.a
-  └─ ieee80211_freedom_output()  — libnet80211.a
+wifi_send_pkt_freedom()        — libmain.a
+  └─ ieee80211_freedom_output() — libnet80211.a
 ```
 
 ### Channel Sync
