@@ -26,7 +26,7 @@ extern "C" {
 #define DNS_PORT          53
 #define SSID_MAX_LEN      32
 #define BEACON_BUF_SIZE   100
-#define BEACONS_PER_BURST 50   // raw frames injected per loop iteration
+#define BURST_SIZE_DEFAULT 50  // used only on first boot
 
 const char* CONFIG_AP_SSID = "WifiBroadcaster";  // open setup network
 
@@ -35,10 +35,11 @@ DNSServer        dnsServer;
 ESP8266WebServer server(80);
 
 struct Config {
-  char    target_ssid[SSID_MAX_LEN];
-  uint8_t channel;
-  bool    flooding;
-  uint8_t magic;   // 0xAB = valid, anything else = first boot
+  char     target_ssid[SSID_MAX_LEN];
+  uint8_t  channel;
+  bool     flooding;
+  uint16_t burst_size;  // beacons injected per loop iteration
+  uint8_t  magic;       // 0xAC = valid, anything else = first boot
 };
 
 Config  config;
@@ -96,7 +97,7 @@ void sendBeaconBurst() {
   uint8_t base_len = strnlen(config.target_ssid, SSID_MAX_LEN);
   uint8_t buf[BEACON_BUF_SIZE];
 
-  for (int i = 0; i < BEACONS_PER_BURST; i++) {
+  for (int i = 0; i < config.burst_size; i++) {
     // Fixed header
     memcpy(buf, BEACON_FIXED, 36);
 
@@ -143,11 +144,12 @@ void saveConfig() {
 
 void loadConfig() {
   EEPROM.get(0, config);
-  if (config.magic != 0xAB) {
+  if (config.magic != 0xAC) {
     strncpy(config.target_ssid, "TargetSSID", SSID_MAX_LEN);
-    config.channel  = 6;
-    config.flooding = false;
-    config.magic    = 0xAB;
+    config.channel    = 6;
+    config.flooding   = false;
+    config.burst_size = BURST_SIZE_DEFAULT;
+    config.magic      = 0xAC;
     saveConfig();
     Serial.println("First boot — defaults written to EEPROM");
   }
@@ -157,9 +159,10 @@ void loadConfig() {
 
 void handleStatus() {
   String json = "{";
-  json += "\"flooding\":"  + String(config.flooding ? "true" : "false") + ",";
-  json += "\"ssid\":\""    + String(config.target_ssid) + "\",";
-  json += "\"channel\":"   + String(config.channel);
+  json += "\"flooding\":"    + String(config.flooding ? "true" : "false") + ",";
+  json += "\"ssid\":\""      + String(config.target_ssid) + "\",";
+  json += "\"channel\":"     + String(config.channel) + ",";
+  json += "\"burst_size\":"  + String(config.burst_size);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -184,13 +187,22 @@ void handleSetConfig() {
     }
   }
 
+  if (server.hasArg("burst")) {
+    int b = server.arg("burst").toInt();
+    if (b > 0 && b <= 1000) {
+      config.burst_size = (uint16_t)b;
+      changed = true;
+    }
+  }
+
   if (changed) {
     saveConfig();
     prepareBeaconTemplate();
     // Restart softAP on the updated channel so raw frames go out on the right channel
     WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
     Serial.println("Config updated — SSID: " + String(config.target_ssid)
-                   + "  ch: " + String(config.channel));
+                   + "  ch: " + String(config.channel)
+                   + "  burst: " + String(config.burst_size));
   }
 
   server.send(200, "text/plain", "OK");
@@ -271,6 +283,16 @@ void handleRoot() {
       <option>13</option>
     </select>
 
+    <label>SSID COUNT PER BURST</label>
+    <select id="burst">
+      <option value="10">10</option>
+      <option value="25">25</option>
+      <option value="50" selected>50</option>
+      <option value="100">100</option>
+      <option value="200">200</option>
+      <option value="500">500</option>
+    </select>
+
     <button class="btn btn-save"   onclick="saveConfig()">Save Config</button>
     <button class="btn btn-toggle" id="toggleBtn" onclick="toggle()">Start Flooding</button>
 
@@ -282,10 +304,12 @@ void handleRoot() {
       fetch('/status').then(r => r.json()).then(d => {
         // Only update inputs when they don't have focus — prevents overwriting
         // whatever the user is currently typing
-        const ssidEl = document.getElementById('ssid');
-        const chEl   = document.getElementById('channel');
-        if (document.activeElement !== ssidEl) ssidEl.value = d.ssid;
-        if (document.activeElement !== chEl)   chEl.value   = String(d.channel);
+        const ssidEl  = document.getElementById('ssid');
+        const chEl    = document.getElementById('channel');
+        const burstEl = document.getElementById('burst');
+        if (document.activeElement !== ssidEl)  ssidEl.value  = d.ssid;
+        if (document.activeElement !== chEl)    chEl.value    = String(d.channel);
+        if (document.activeElement !== burstEl) burstEl.value = String(d.burst_size);
         const badge = document.getElementById('badge');
         const btn   = document.getElementById('toggleBtn');
         if (d.flooding) {
@@ -300,7 +324,8 @@ void handleRoot() {
 
     function saveConfig() {
       const body = 'ssid='     + encodeURIComponent(document.getElementById('ssid').value.trim())
-                 + '&channel=' + document.getElementById('channel').value;
+                 + '&channel=' + document.getElementById('channel').value
+                 + '&burst='   + document.getElementById('burst').value;
       fetch('/set_config', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
