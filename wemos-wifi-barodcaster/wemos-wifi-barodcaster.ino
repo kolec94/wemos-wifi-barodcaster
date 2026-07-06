@@ -26,7 +26,16 @@ extern "C" {
 #define DNS_PORT          53
 #define SSID_MAX_LEN      32
 #define BEACON_BUF_SIZE   100
-#define BURST_SIZE_DEFAULT 50  // used only on first boot
+#define BURST_SIZE_DEFAULT 50   // used only on first boot
+#define BURST_SIZE_MAX    1000  // hard ceiling accepted from the UI
+#define CHANNEL_MAX       13    // 802.11bgn 2.4 GHz channels offered by the UI
+
+// Largest frame sendBeaconBurst() can assemble on the stack:
+//   36 fixed header/fields + 2 SSID tag header + up to SSID_MAX_LEN name bytes
+//   + 4 random suffix bytes + 10 Supported Rates + 3 DS Parameter Set.
+// Keep BEACON_BUF_SIZE >= this or the per-frame buffer overflows.
+static_assert(BEACON_BUF_SIZE >= 36 + 2 + SSID_MAX_LEN + 4 + 10 + 3,
+              "BEACON_BUF_SIZE too small for the maximum beacon frame");
 
 const char* CONFIG_AP_SSID = "WifiBroadcaster";  // open setup network
 
@@ -43,8 +52,7 @@ struct Config {
 };
 
 Config  config;
-uint8_t beacon_buf[BEACON_BUF_SIZE];
-int     beacon_len = 0;
+int     beacon_len = 0;   // 0 = no valid SSID configured; >0 = ready to flood
 
 /*
  * Fixed portion of every beacon frame:
@@ -132,12 +140,26 @@ void sendBeaconBurst() {
     buf[pos++] = 0x03; buf[pos++] = 0x01; buf[pos++] = config.channel;
 
     wifi_send_pkt_freedom(buf, pos, false);
+
+    // Feed the soft WDT and let the SDK drain its TX queue. Without this a large
+    // burst starves the WiFi/system task and triggers a watchdog reset mid-flood
+    // (and also drops frames once the internal TX buffer backs up).
+    if ((i & 0x1F) == 0) yield();
   }
 }
 
 // ------------------------------------------------------- EEPROM --
 
+/*
+ * Persist config, but only actually erase+rewrite flash when something changed.
+ * ESP8266 EEPROM is flash-emulated (~10k–100k erase cycles/sector) and commit()
+ * rewrites the whole sector with interrupts off, so skipping no-op writes both
+ * spares the flash and avoids needless stalls during a flood.
+ */
 void saveConfig() {
+  Config stored;
+  EEPROM.get(0, stored);
+  if (memcmp(&stored, &config, sizeof(Config)) == 0) return;
   EEPROM.put(0, config);
   EEPROM.commit();
 }
@@ -152,7 +174,16 @@ void loadConfig() {
     config.magic      = 0xAC;
     saveConfig();
     Serial.println("First boot — defaults written to EEPROM");
+    return;
   }
+
+  // Stored image is "valid" by magic byte, but treat its contents as untrusted:
+  // a corrupt/legacy blob could leave target_ssid unterminated (out-of-bounds
+  // String reads) or channel/burst out of range (bad frames / apparent hangs).
+  config.target_ssid[SSID_MAX_LEN - 1] = '\0';
+  if (config.channel < 1 || config.channel > CHANNEL_MAX) config.channel = 6;
+  if (config.burst_size < 1 || config.burst_size > BURST_SIZE_MAX)
+    config.burst_size = BURST_SIZE_DEFAULT;
 }
 
 // ----------------------------------------------------- web server --
@@ -181,7 +212,7 @@ void handleSetConfig() {
 
   if (server.hasArg("channel")) {
     int ch = server.arg("channel").toInt();
-    if (ch >= 1 && ch <= 13) {
+    if (ch >= 1 && ch <= CHANNEL_MAX) {
       config.channel = (uint8_t)ch;
       changed = true;
     }
@@ -189,7 +220,7 @@ void handleSetConfig() {
 
   if (server.hasArg("burst")) {
     int b = server.arg("burst").toInt();
-    if (b > 0 && b <= 1000) {
+    if (b > 0 && b <= BURST_SIZE_MAX) {
       config.burst_size = (uint16_t)b;
       changed = true;
     }
@@ -387,6 +418,9 @@ void setup() {
   // WiFi.disconnect() ensures it never actually tries to associate with anything.
   WiFi.mode(WIFI_AP_STA);
   WiFi.disconnect();
+  // Keep the radio fully awake: default modem sleep lets the PHY nap between
+  // activity, which drops softAP clients and stutters raw frame injection.
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
 
   Serial.println("Config AP : " + String(CONFIG_AP_SSID) + "  ch: " + String(config.channel));
