@@ -28,7 +28,8 @@ extern "C" {
 #define BEACON_BUF_SIZE   100
 #define BURST_SIZE_DEFAULT 50   // used only on first boot
 #define BURST_SIZE_MAX    1000  // hard ceiling accepted from the UI
-#define CHANNEL_MAX       13    // 802.11bgn 2.4 GHz channels offered by the UI
+#define CHANNEL_MAX       11    // US (FCC) 2.4 GHz channels; 12/13 are not US-legal
+                                // and don't transmit on a default-region radio
 
 // Largest frame sendBeaconBurst() can assemble on the stack:
 //   36 fixed header/fields + 2 SSID tag header + up to SSID_MAX_LEN name bytes
@@ -52,7 +53,7 @@ struct Config {
 };
 
 Config  config;
-int     beacon_len = 0;   // 0 = no valid SSID configured; >0 = ready to flood
+bool    beaconReady = false;   // false = no valid SSID configured; true = ready to flood
 
 /*
  * Fixed portion of every beacon frame:
@@ -80,12 +81,12 @@ const uint8_t BEACON_FIXED[36] = {
 
 /*
  * Validate config and arm the burst sender.
- * beacon_len > 0 means a valid SSID is configured and flooding can run.
+ * beaconReady == true means a valid SSID is configured and flooding can run.
  * The packet is no longer pre-built here — sendBeaconBurst constructs
  * each frame fresh so the SSID suffix can be randomised per frame.
  */
 void prepareBeaconTemplate() {
-  beacon_len = (strnlen(config.target_ssid, SSID_MAX_LEN) > 0) ? 1 : 0;
+  beaconReady = (strnlen(config.target_ssid, SSID_MAX_LEN) > 0);
 }
 
 /*
@@ -100,7 +101,7 @@ void prepareBeaconTemplate() {
  * is assembled fresh each time.
  */
 void sendBeaconBurst() {
-  if (beacon_len == 0) return;
+  if (!beaconReady) return;
 
   uint8_t base_len = strnlen(config.target_ssid, SSID_MAX_LEN);
   uint8_t buf[BEACON_BUF_SIZE];
@@ -139,7 +140,12 @@ void sendBeaconBurst() {
     // Tag 3: DS Parameter Set
     buf[pos++] = 0x03; buf[pos++] = 0x01; buf[pos++] = config.channel;
 
-    wifi_send_pkt_freedom(buf, pos, false);
+    // Non-zero means the SDK TX queue is full; yield immediately so it can
+    // drain instead of spinning and dropping frames.
+    if (wifi_send_pkt_freedom(buf, pos, false) != 0) {
+      yield();
+      continue;
+    }
 
     // Feed the soft WDT and let the SDK drain its TX queue. Without this a large
     // burst starves the WiFi/system task and triggers a watchdog reset mid-flood
@@ -200,6 +206,7 @@ void handleStatus() {
 
 void handleSetConfig() {
   bool changed = false;
+  uint8_t prev_channel = config.channel;
 
   if (server.hasArg("ssid")) {
     String s = server.arg("ssid");
@@ -229,8 +236,20 @@ void handleSetConfig() {
   if (changed) {
     saveConfig();
     prepareBeaconTemplate();
-    // Restart softAP on the updated channel so raw frames go out on the right channel
-    WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
+
+    // Only retune the radio when the channel actually changed — an SSID- or
+    // burst-only edit shouldn't knock the UI client off the AP. When it does
+    // change, quiesce injection first: restarting the softAP while promiscuous
+    // mode is hammering the PHY can destabilise the radio. The connected client
+    // still drops (single radio: the AP has to move to the new channel) and
+    // reconnects to WifiBroadcaster on that channel.
+    if (config.channel != prev_channel) {
+      bool was_flooding = config.flooding;
+      if (was_flooding) wifi_promiscuous_enable(0);
+      WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
+      if (was_flooding) wifi_promiscuous_enable(1);
+    }
+
     Serial.println("Config updated — SSID: " + String(config.target_ssid)
                    + "  ch: " + String(config.channel)
                    + "  burst: " + String(config.burst_size));
@@ -310,8 +329,7 @@ void handleRoot() {
     <select id="channel">
       <option>1</option><option>2</option><option>3</option><option>4</option>
       <option>5</option><option>6</option><option>7</option><option>8</option>
-      <option>9</option><option>10</option><option>11</option><option>12</option>
-      <option>13</option>
+      <option>9</option><option>10</option><option>11</option>
     </select>
 
     <label>SSID COUNT PER BURST</label>
@@ -440,7 +458,7 @@ void setup() {
 }
 
 void loop() {
-  if (config.flooding && beacon_len > 0) {
+  if (config.flooding && beaconReady) {
     sendBeaconBurst();
   }
   dnsServer.processNextRequest();
