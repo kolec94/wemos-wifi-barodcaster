@@ -32,7 +32,7 @@ flowchart TD
     O --> P{Request?}
     P -->|GET /| Q[Serve web UI\nloads once on connect]
     P -->|GET /status| R[Return JSON\nssid, channel, burst_size, flooding]
-    P -->|POST /set_config| S[Update SSID, channel, burst size\nrebuild beacon template\nrestart softAP on new channel]
+    P -->|POST /set_config| S[Update SSID, channel, burst size\nrebuild beacon template\nretune softAP only if channel changed]
     P -->|POST /toggle| T{New flood state?}
     T -->|ON| U[prepareBeaconTemplate\nwifi_promiscuous_enable 1\nstart flooding]
     T -->|OFF| V[wifi_promiscuous_enable 0\nstop flooding]
@@ -77,7 +77,7 @@ MAC addresses use locally-administered unicast format (bit 1 set, bit 0 clear in
 
 ## Installation
 
-1. Open `wifi_broadcaster.ino` in Arduino IDE
+1. Open `wemos-wifi-barodcaster/wemos-wifi-barodcaster.ino` in Arduino IDE
 2. **Tools → Board → ESP8266 Boards → LOLIN(WEMOS) D1 mini Lite**
 3. **Tools → Port** → select the Wemos port
 4. Upload (→)
@@ -97,7 +97,7 @@ No credentials need editing — everything is configured at runtime.
 | Field | Options | Description |
 |-------|---------|-------------|
 | **Target SSID** | any string, max 31 chars | The base SSID name to flood |
-| **Channel** | 1–13 | WiFi channel to inject on |
+| **Channel** | 1–11 | WiFi channel to inject on (US/FCC range; 12–13 omitted — not US-legal and unreliable on a default-region radio) |
 | **SSID Count Per Burst** | 10 / 25 / 50 / 100 / 200 / 500 | Unique frames injected per loop iteration |
 
 1. Enter the target SSID, select the channel and burst size
@@ -124,7 +124,7 @@ The phone's built-in WiFi settings deduplicate by SSID name — they will always
 
 ### Reconfiguring While Flooding
 
-The config AP (`WifiBroadcaster`) stays up on the same channel throughout. Connect to it and visit `192.168.4.1` to change settings or stop flooding at any time. Config and flood state persist across power cycles — the device resumes on reboot.
+Connect to the config AP (`WifiBroadcaster`) and visit `192.168.4.1` to change settings or stop flooding at any time. Changing the **SSID** or **burst size** applies without disturbing your connection. Changing the **channel** is the exception: because the ESP8266 has a single radio, the config AP has to move with it, so your device briefly drops and must reconnect to `WifiBroadcaster` on the new channel. Config and flood state persist across power cycles — the device resumes on reboot.
 
 ## Configuration Options
 
@@ -166,7 +166,7 @@ wifi_send_pkt_freedom()        — libmain.a
 
 ### Channel Sync
 
-`wifi_send_pkt_freedom` transmits on whatever channel the radio is currently tuned to. When the user changes the channel via `set_config`, the softAP is restarted on the new channel before injection resumes, keeping the config AP and the flood channel in sync.
+`wifi_send_pkt_freedom` transmits on whatever channel the radio is currently tuned to. The softAP is restarted on the new channel **only when the channel actually changes** (an SSID- or burst-only save leaves the AP — and your connection — untouched). During that retune, promiscuous injection is disabled first and re-enabled afterward, so the softAP isn't torn down while the PHY is under active injection.
 
 ### Single Radio
 

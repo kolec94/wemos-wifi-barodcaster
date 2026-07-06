@@ -26,7 +26,17 @@ extern "C" {
 #define DNS_PORT          53
 #define SSID_MAX_LEN      32
 #define BEACON_BUF_SIZE   100
-#define BURST_SIZE_DEFAULT 50  // used only on first boot
+#define BURST_SIZE_DEFAULT 50   // used only on first boot
+#define BURST_SIZE_MAX    1000  // hard ceiling accepted from the UI
+#define CHANNEL_MAX       11    // US (FCC) 2.4 GHz channels; 12/13 are not US-legal
+                                // and don't transmit on a default-region radio
+
+// Largest frame sendBeaconBurst() can assemble on the stack:
+//   36 fixed header/fields + 2 SSID tag header + up to SSID_MAX_LEN name bytes
+//   + 4 random suffix bytes + 10 Supported Rates + 3 DS Parameter Set.
+// Keep BEACON_BUF_SIZE >= this or the per-frame buffer overflows.
+static_assert(BEACON_BUF_SIZE >= 36 + 2 + SSID_MAX_LEN + 4 + 10 + 3,
+              "BEACON_BUF_SIZE too small for the maximum beacon frame");
 
 const char* CONFIG_AP_SSID = "WifiBroadcaster";  // open setup network
 
@@ -43,8 +53,7 @@ struct Config {
 };
 
 Config  config;
-uint8_t beacon_buf[BEACON_BUF_SIZE];
-int     beacon_len = 0;
+bool    beaconReady = false;   // false = no valid SSID configured; true = ready to flood
 
 /*
  * Fixed portion of every beacon frame:
@@ -72,12 +81,12 @@ const uint8_t BEACON_FIXED[36] = {
 
 /*
  * Validate config and arm the burst sender.
- * beacon_len > 0 means a valid SSID is configured and flooding can run.
+ * beaconReady == true means a valid SSID is configured and flooding can run.
  * The packet is no longer pre-built here — sendBeaconBurst constructs
  * each frame fresh so the SSID suffix can be randomised per frame.
  */
 void prepareBeaconTemplate() {
-  beacon_len = (strnlen(config.target_ssid, SSID_MAX_LEN) > 0) ? 1 : 0;
+  beaconReady = (strnlen(config.target_ssid, SSID_MAX_LEN) > 0);
 }
 
 /*
@@ -92,7 +101,7 @@ void prepareBeaconTemplate() {
  * is assembled fresh each time.
  */
 void sendBeaconBurst() {
-  if (beacon_len == 0) return;
+  if (!beaconReady) return;
 
   uint8_t base_len = strnlen(config.target_ssid, SSID_MAX_LEN);
   uint8_t buf[BEACON_BUF_SIZE];
@@ -131,13 +140,32 @@ void sendBeaconBurst() {
     // Tag 3: DS Parameter Set
     buf[pos++] = 0x03; buf[pos++] = 0x01; buf[pos++] = config.channel;
 
-    wifi_send_pkt_freedom(buf, pos, false);
+    // Non-zero means the SDK TX queue is full; yield immediately so it can
+    // drain instead of spinning and dropping frames.
+    if (wifi_send_pkt_freedom(buf, pos, false) != 0) {
+      yield();
+      continue;
+    }
+
+    // Feed the soft WDT and let the SDK drain its TX queue. Without this a large
+    // burst starves the WiFi/system task and triggers a watchdog reset mid-flood
+    // (and also drops frames once the internal TX buffer backs up).
+    if ((i & 0x1F) == 0) yield();
   }
 }
 
 // ------------------------------------------------------- EEPROM --
 
+/*
+ * Persist config, but only actually erase+rewrite flash when something changed.
+ * ESP8266 EEPROM is flash-emulated (~10k–100k erase cycles/sector) and commit()
+ * rewrites the whole sector with interrupts off, so skipping no-op writes both
+ * spares the flash and avoids needless stalls during a flood.
+ */
 void saveConfig() {
+  Config stored;
+  EEPROM.get(0, stored);
+  if (memcmp(&stored, &config, sizeof(Config)) == 0) return;
   EEPROM.put(0, config);
   EEPROM.commit();
 }
@@ -152,7 +180,16 @@ void loadConfig() {
     config.magic      = 0xAC;
     saveConfig();
     Serial.println("First boot — defaults written to EEPROM");
+    return;
   }
+
+  // Stored image is "valid" by magic byte, but treat its contents as untrusted:
+  // a corrupt/legacy blob could leave target_ssid unterminated (out-of-bounds
+  // String reads) or channel/burst out of range (bad frames / apparent hangs).
+  config.target_ssid[SSID_MAX_LEN - 1] = '\0';
+  if (config.channel < 1 || config.channel > CHANNEL_MAX) config.channel = 6;
+  if (config.burst_size < 1 || config.burst_size > BURST_SIZE_MAX)
+    config.burst_size = BURST_SIZE_DEFAULT;
 }
 
 // ----------------------------------------------------- web server --
@@ -169,6 +206,7 @@ void handleStatus() {
 
 void handleSetConfig() {
   bool changed = false;
+  uint8_t prev_channel = config.channel;
 
   if (server.hasArg("ssid")) {
     String s = server.arg("ssid");
@@ -181,7 +219,7 @@ void handleSetConfig() {
 
   if (server.hasArg("channel")) {
     int ch = server.arg("channel").toInt();
-    if (ch >= 1 && ch <= 13) {
+    if (ch >= 1 && ch <= CHANNEL_MAX) {
       config.channel = (uint8_t)ch;
       changed = true;
     }
@@ -189,7 +227,7 @@ void handleSetConfig() {
 
   if (server.hasArg("burst")) {
     int b = server.arg("burst").toInt();
-    if (b > 0 && b <= 1000) {
+    if (b > 0 && b <= BURST_SIZE_MAX) {
       config.burst_size = (uint16_t)b;
       changed = true;
     }
@@ -198,8 +236,20 @@ void handleSetConfig() {
   if (changed) {
     saveConfig();
     prepareBeaconTemplate();
-    // Restart softAP on the updated channel so raw frames go out on the right channel
-    WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
+
+    // Only retune the radio when the channel actually changed — an SSID- or
+    // burst-only edit shouldn't knock the UI client off the AP. When it does
+    // change, quiesce injection first: restarting the softAP while promiscuous
+    // mode is hammering the PHY can destabilise the radio. The connected client
+    // still drops (single radio: the AP has to move to the new channel) and
+    // reconnects to WifiBroadcaster on that channel.
+    if (config.channel != prev_channel) {
+      bool was_flooding = config.flooding;
+      if (was_flooding) wifi_promiscuous_enable(0);
+      WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
+      if (was_flooding) wifi_promiscuous_enable(1);
+    }
+
     Serial.println("Config updated — SSID: " + String(config.target_ssid)
                    + "  ch: " + String(config.channel)
                    + "  burst: " + String(config.burst_size));
@@ -279,8 +329,7 @@ void handleRoot() {
     <select id="channel">
       <option>1</option><option>2</option><option>3</option><option>4</option>
       <option>5</option><option>6</option><option>7</option><option>8</option>
-      <option>9</option><option>10</option><option>11</option><option>12</option>
-      <option>13</option>
+      <option>9</option><option>10</option><option>11</option>
     </select>
 
     <label>SSID COUNT PER BURST</label>
@@ -387,6 +436,9 @@ void setup() {
   // WiFi.disconnect() ensures it never actually tries to associate with anything.
   WiFi.mode(WIFI_AP_STA);
   WiFi.disconnect();
+  // Keep the radio fully awake: default modem sleep lets the PHY nap between
+  // activity, which drops softAP clients and stutters raw frame injection.
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
 
   Serial.println("Config AP : " + String(CONFIG_AP_SSID) + "  ch: " + String(config.channel));
@@ -406,7 +458,7 @@ void setup() {
 }
 
 void loop() {
-  if (config.flooding && beacon_len > 0) {
+  if (config.flooding && beaconReady) {
     sendBeaconBurst();
   }
   dnsServer.processNextRequest();
