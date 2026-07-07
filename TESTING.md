@@ -46,6 +46,16 @@ The counter matches on the SSID **prefix** (the base name), because the flooder
 appends 1–4 random non-printable bytes per frame — so a healthy `match/s` also
 confirms the per-frame SSID-uniqueness behaviour.
 
+### Viewing both serial consoles at once
+
+`test-tools/serial-dashboard/index.html` is a self-contained Web Serial page
+(Chrome/Edge only) with two independent panels, so you can watch the DUT and
+the instrument side by side instead of juggling two serial monitor windows.
+Open the file directly in the browser (not hosted — it needs direct top-level
+access to the ports), click **Connect** on each panel, and pick the DUT's port
+and the instrument's port respectively. Each panel connects at 115200 baud with
+optional per-line timestamps.
+
 ## Test matrix
 
 Each case targets a specific fix. `match/s` refers to the instrument's output.
