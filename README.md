@@ -84,6 +84,26 @@ MAC addresses use locally-administered unicast format (bit 1 set, bit 0 clear in
 
 No credentials need editing — everything is configured at runtime.
 
+## Hardware Validation / Testing
+
+Validating changes to the flooder requires a **second Wemos D1 Mini** running a
+passive counter instrument — a receive-only sketch that never transmits, it just
+listens on the test channel and reports beacon rates over serial.
+
+| Device | Firmware | Role |
+|--------|----------|------|
+| D1 #1 (DUT) | `wemos-wifi-barodcaster/wemos-wifi-barodcaster.ino` | Runs the flood |
+| D1 #2 (Instrument) | `test-tools/beacon-counter/beacon-counter.ino` | Passive promiscuous receiver; counts matching vs. other beacons/sec |
+
+To flash the counter onto the second board:
+
+1. Open `test-tools/beacon-counter/beacon-counter.ino`
+2. Set `TARGET_SSID` and `LISTEN_CHAN` to match the flooder's configured SSID and channel
+3. **Tools → Board → ESP8266 Boards → LOLIN(WEMOS) D1 mini Lite**, select its port, Upload
+4. Open its serial monitor at 115200 baud — it prints `match/s  other/s  |  total_match  total_other` once per second
+
+See [TESTING.md](TESTING.md) for the full closed emit → detect → count rig, RF-isolation requirements, and the test matrix used to validate stability fixes.
+
 ## Usage
 
 ### First Time Setup
