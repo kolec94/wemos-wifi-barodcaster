@@ -48,6 +48,7 @@
     width: 160px;
   }
   .panel-head input[type=text]:focus { outline: none; border-bottom-color: var(--accent); }
+  .panel-head input.port-input { width: 70px; color: var(--accent); font-weight: 600; }
   .status-dot {
     width: 9px; height: 9px; border-radius: 50%; background: var(--dim); flex: none;
   }
@@ -98,6 +99,7 @@
     <div class="panel-head">
       <span class="status-dot"></span>
       <input type="text" class="name-input" spellcheck="false">
+      <input type="text" class="port-input" placeholder="COM…" spellcheck="false" title="Windows shows this in the port picker dialog — the page can't read it back, so type it in once">
       <span class="status-text">disconnected</span>
       <div class="spacer"></div>
       <button class="connect-btn">Connect</button>
@@ -131,6 +133,7 @@ if (!('serial' in navigator)) {
 
     const dot        = panel.querySelector('.status-dot');
     const nameInput   = panel.querySelector('.name-input');
+    const portInput   = panel.querySelector('.port-input');
     const statusText  = panel.querySelector('.status-text');
     const connectBtn  = panel.querySelector('.connect-btn');
     const disconnectBtn = panel.querySelector('.disconnect-btn');
@@ -146,11 +149,28 @@ if (!('serial' in navigator)) {
     let reader = null;
     let keepReading = false;
     let lineCount = 0;
+    let tearingDown = false;
+    let lastState = '';
+    let lastLabel = 'disconnected';
+
+    // The Web Serial API deliberately never exposes the OS port path (e.g.
+    // "COM12") back to the page — only USB vendor/product IDs, which are
+    // identical for both boards here since they use the same CH340 chip.
+    // So the port number is a manually-typed label, not something read from
+    // the connection; this just appends it to the status line for visibility.
+    function portSuffix() {
+      const v = portInput.value.trim();
+      return v ? ' — ' + v : '';
+    }
 
     function setStatus(state, label) {
+      lastState = state;
+      lastLabel = label;
       dot.className = 'status-dot' + (state ? ' ' + state : '');
-      statusText.textContent = label;
+      statusText.textContent = label + (state === 'connected' ? portSuffix() : '');
     }
+
+    portInput.addEventListener('input', () => setStatus(lastState, lastLabel));
 
     function appendLine(text, cls) {
       const div = document.createElement('div');
@@ -171,14 +191,16 @@ if (!('serial' in navigator)) {
     }
 
     async function connect() {
+      if (port) return; // already connected, or mid-teardown from a previous session
       try {
-        port = await navigator.serial.requestPort();
-        await port.open({ baudRate: 115200 });
+        const chosen = await navigator.serial.requestPort();
+        await chosen.open({ baudRate: 115200 });
+        port = chosen;
         keepReading = true;
         setStatus('connected', 'connected @115200');
         connectBtn.disabled = true;
         disconnectBtn.disabled = false;
-        appendLine('-- connected --', 'sys');
+        appendLine('-- connected' + portSuffix() + ' --', 'sys');
         readLoop();
       } catch (err) {
         if (err.name !== 'NotFoundError') {
@@ -187,17 +209,19 @@ if (!('serial' in navigator)) {
       }
     }
 
+    // Reads raw bytes directly off port.readable (no pipeTo/TextDecoderStream
+    // in between) so there is only ever one lock to manage, and teardown()
+    // can release + close in a single, race-free sequence.
     async function readLoop() {
-      const textDecoder = new TextDecoderStream();
-      const readableClosed = port.readable.pipeTo(textDecoder.writable).catch(() => {});
-      reader = textDecoder.readable.getReader();
+      const decoder = new TextDecoder();
+      reader = port.readable.getReader();
       let buf = '';
       try {
         while (keepReading) {
           const { value, done } = await reader.read();
           if (done) break;
           if (value) {
-            buf += value;
+            buf += decoder.decode(value, { stream: true });
             let idx;
             while ((idx = buf.indexOf('\n')) >= 0) {
               const rawLine = buf.slice(0, idx).replace(/\r$/, '');
@@ -207,32 +231,42 @@ if (!('serial' in navigator)) {
           }
         }
       } catch (err) {
+        // A yanked cable surfaces here as a read error (e.g. "device has
+        // been lost") rather than through the reader.cancel() path below.
         appendLine('read error: ' + err.message, 'err');
       } finally {
-        reader.releaseLock();
-        await readableClosed;
+        await teardown();
       }
     }
 
-    async function disconnect() {
+    // Single idempotent teardown path for both "Disconnect" clicks and the
+    // read loop ending on its own (cable pulled, device reset, etc). Always
+    // releases the reader lock and closes the port in the same order, so
+    // there's never a race between a lingering lock and port.close().
+    async function teardown() {
+      if (tearingDown) return;
+      tearingDown = true;
       keepReading = false;
-      setStatus('', 'disconnecting…');
-      try {
-        if (reader) await reader.cancel();
-        if (port) await port.close();
-      } catch (err) {
-        appendLine('disconnect error: ' + err.message, 'err');
+
+      if (reader) {
+        try { await reader.cancel(); } catch (err) { /* already gone, fine */ }
+        try { reader.releaseLock(); } catch (err) { /* already released */ }
+        reader = null;
       }
+      if (port) {
+        try { await port.close(); } catch (err) { /* device likely unplugged */ }
+        port = null;
+      }
+
       appendLine('-- disconnected --', 'sys');
       setStatus('', 'disconnected');
       connectBtn.disabled = false;
       disconnectBtn.disabled = true;
-      port = null;
-      reader = null;
+      tearingDown = false;
     }
 
     connectBtn.addEventListener('click', connect);
-    disconnectBtn.addEventListener('click', disconnect);
+    disconnectBtn.addEventListener('click', () => { teardown(); });
     clearBtn.addEventListener('click', () => {
       logEl.innerHTML = '';
       lineCount = 0;
@@ -240,10 +274,11 @@ if (!('serial' in navigator)) {
     });
 
     navigator.serial.addEventListener('disconnect', (e) => {
+      // Physical unplug: the pending reader.read() in readLoop will also
+      // reject shortly and route through the same teardown(), this just
+      // gives immediate UI feedback rather than waiting on that rejection.
       if (e.target === port) {
         setStatus('error', 'device unplugged');
-        connectBtn.disabled = false;
-        disconnectBtn.disabled = true;
       }
     });
   }
