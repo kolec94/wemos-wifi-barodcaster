@@ -1,101 +1,235 @@
-# Testing methodology
+# Hardware testing
 
-A repeatable, self-contained procedure for validating the beacon flooder on real
-hardware — in particular the device-stability fixes from #1 (WDT survival, UI
-responsiveness, AP stability, clean channel changes). It uses **two Wemos D1
-Mini boards plus a laptop** as a closed emit → detect → count loop, so nothing
-is ever aimed at a real network.
+This guide validates the DUT with a second Wemos D1 Mini acting as a passive
+measurement instrument. Start with [BUILDING.md](BUILDING.md) if the sketches
+are not compiled and flashed yet. Return to the [README](README.md) for normal
+operation and API details.
 
-> Beacon flooding is a broadcast **denial-of-service** technique, not a
-> machine-in-the-middle attack — nothing sits between a client and an AP. The
-> laptop here is an **orchestrator/observer**, and the second D1 is a passive
-> **measurement instrument**, not a victim.
+## Safety and isolation
 
-## Safety & isolation (required, and also a test-validity requirement)
+Run every transmitting test inside a proper RF shield box or screen room.
+Isolation is both a safety requirement and a measurement requirement: ambient
+beacons contaminate the counter and make the results ambiguous.
 
-Run the whole rig **RF-isolated**. This is both the legal line (operating a
-flooder over the air violates FCC Part 15 / Ofcom and equivalents) *and* a
-measurement requirement: ambient beacons on your test channel pollute the
-counts and invalidate the results.
+- Put the DUT, counter, phone/adapter antenna, and all RF paths inside the
+  isolated volume before powering the DUT.
+- Use USB feedthroughs for serial and power.
+- Confirm the DUT is stopped before opening the enclosure.
+- Do not treat a foil-lined container or improvised metal box as verified RF
+  containment.
 
-- **Best:** a proper RF shield box / screen room.
-- **Budget:** the best cheap option is *distance + a dead channel* — physically
-  far from any other people/networks, on a channel a scan shows is empty. DIY
-  faraday enclosures (foil-lined boxes, ammo cans, paint cans) leak badly and
-  are **not** a reliable substitute for a shield box; don't trust them to
-  contain the RF.
-- **Always:** keep sessions short, pick an isolated channel, and scan first to
-  confirm nothing else is on it.
+## Test rig
 
-## The rig
+| Role | Hardware | Firmware or tool |
+| --- | --- | --- |
+| DUT | Wemos D1 Mini Lite #1 | [Main firmware](wemos-wifi-barodcaster/wemos-wifi-barodcaster.ino) |
+| Instrument | Wemos D1 Mini Lite #2 | [Passive counter](test-tools/beacon-counter/beacon-counter.ino) |
+| Serial observer | Laptop | [Two-port dashboard](test-tools/serial-dashboard/index.html) |
+| UI client | Phone or dedicated WiFi adapter | Connects only to `WifiBroadcaster` |
 
-| Role | Hardware | Job |
-|------|----------|-----|
-| **DUT** (device under test) | D1 #1 — `wemos-wifi-barodcaster/` firmware | Runs the flood |
-| **Instrument** | D1 #2 — `test-tools/beacon-counter/` | Passive promiscuous receiver; counts matching vs. other beacons/sec on the test channel |
-| **Orchestrator** | Laptop | (a) serial console on the DUT for resets/uptime/heap; (b) WiFi client to drive the config UI; (c) *optional* Wireshark on a monitor-mode adapter as ground truth |
+The instrument is receive-only. It groups a beacon as matching when the SSID
+starts with the configured base SSID; this accommodates the DUT's changing
+1-4-byte suffix.
 
-### Instrument setup
+## Preflight
 
-1. Open `test-tools/beacon-counter/beacon-counter.ino`.
-2. Flash to D1 #2 and open its serial monitor at 115200.
-3. Send `ssid <name>` and `channel <1-11>` to match the flooder's base SSID and
-   channel. Send `show` to confirm the active configuration (`help` lists all
-   commands). Changes are volatile and take effect immediately without reflashing.
-4. The counter prints one line per
-   second: `match/s  other/s  |  total_match  total_other`.
+1. Record the firmware commit:
 
-The counter matches on the SSID **prefix** (the base name), because the flooder
-appends 1–4 random non-printable bytes per frame — so a healthy `match/s` also
-confirms the per-frame SSID-uniqueness behaviour.
+   ```powershell
+   git rev-parse --short HEAD
+   ```
 
-### Viewing both serial consoles at once
+2. Compile both sketches:
 
-`test-tools/serial-dashboard/index.html` is a self-contained Web Serial page
-(Chrome/Edge only) with two independent panels, so you can watch the DUT and
-the instrument side by side instead of juggling two serial monitor windows.
-Open the file directly in the browser (not hosted — it needs direct top-level
-access to the ports), click **Connect** on each panel, and pick the DUT's port
-and the instrument's port respectively. Each panel connects at 115200 baud with
-optional per-line timestamps.
+   ```powershell
+   ./scripts/build.ps1
+   ```
+
+3. Find the two serial ports:
+
+   ```powershell
+   arduino-cli board list
+   ```
+
+4. Flash the main firmware to the DUT and the counter firmware to the
+   instrument. Exact commands are in [BUILDING.md](BUILDING.md#upload).
+5. Open the [serial dashboard](test-tools/serial-dashboard/index.html) directly
+   in Chrome or Edge. Connect the DUT and instrument at 115200 baud and enable
+   timestamps.
+6. Close any other serial monitor first. A serial port can have only one owner.
+7. Establish dashboard connections before the timed run. A reconnect breaks
+   log continuity and can reset some USB/serial board combinations.
+
+## Configure the instrument
+
+Send commands in the instrument panel:
+
+```text
+ssid TargetSSID
+channel 6
+show
+```
+
+Available commands:
+
+| Command | Result |
+| --- | --- |
+| `show` | Prints the active target and channel |
+| `ssid <name>` | Sets a 1-31-byte SSID prefix |
+| `channel <1-11>` | Retunes immediately |
+| `help` | Lists commands |
+
+Settings are volatile and return to `TargetSSID`/channel 6 after reboot.
+
+## Standard burst-500 soak
+
+1. Confirm containment is closed.
+2. Join `WifiBroadcaster` from the UI client and open
+   `http://192.168.4.1`.
+3. If the DUT resumed flooding from EEPROM, stop it before continuing.
+4. Save SSID `TargetSSID`, channel 6, and burst 500.
+5. Confirm the DUT serial log contains:
+
+   ```text
+   Config updated - SSID: TargetSSID  ch: 6  burst: 500
+   Flooding OFF
+   ```
+
+   The firmware prints a Unicode dash in the actual `Config updated` message;
+   the ASCII form above is shown for terminals that do not decode UTF-8.
+
+6. Confirm the instrument reports `0 match/s` while stopped.
+7. Start flooding and record the start time.
+8. Run for at least 30 minutes. Keep both serial panels connected.
+9. During the run, verify a steady nonzero `match/s`, an accessible UI, and no
+   additional boot banner or reset cause.
+10. Stop flooding and confirm `match/s` immediately returns to zero while
+    `total_match` remains fixed.
+
+### UI client behavior
+
+Phones often leave open networks that do not provide internet, especially when
+the screen locks. For an association test, use one of these:
+
+- A dedicated WiFi adapter with continuous `/status` polling.
+- An iPhone in Airplane Mode with WiFi re-enabled, Auto-Lock set to Never, and
+  the screen kept awake.
+- An Android device configured to stay on a network without internet and kept
+  awake.
+
+A phone roaming away while locked is client behavior, not proof of an AP drop.
+It does, however, invalidate the association portion of that run.
+
+## Read the counter output
+
+The counter prints:
+
+```text
+match/s  other/s  |  total_match  total_other
+```
+
+Example from the verified burst-500 run:
+
+```text
+   947        10    |      169435       217962
+   934        10    |      170369       217972
+```
+
+- `match/s`: target-prefix beacons received during the last second.
+- `other/s`: all other beacons, including the DUT's `WifiBroadcaster` AP.
+- `total_match` and `total_other`: cumulative counts since counter boot.
+
+In the verified isolated setup, burst 500 produced roughly 930-960 matching
+beacons/sec. The config AP contributed roughly 9-11 other beacons/sec. Treat a
+large unexplained increase in `other/s` as possible RF leakage or an unexpected
+transmitter; do not expect `other/s` to be zero while the config AP is running.
 
 ## Test matrix
 
-Each case targets a specific fix. `match/s` refers to the instrument's output.
+| ID | Validates | Procedure | Pass criteria |
+| --- | --- | --- | --- |
+| T1 | Watchdog survival | Run the standard burst-500 soak for 30+ minutes | One boot banner; no `rst cause:4`; no stall |
+| T2 | UI responsiveness | Request `/status` repeatedly during T1 | Responses remain prompt (target under 500 ms); no timeouts |
+| T3 | Config AP stability | Keep a non-sleeping client associated throughout T1 | No DUT-caused disassociation; client remains able to reload the UI |
+| T4 | Emission correctness | Observe the counter during T1 | Steady nonzero `match/s`; only expected config-AP traffic in `other/s` |
+| T5 | Channel changes | Save SSID-only, then channel-only changes | SSID change keeps client; channel change causes one expected reconnect and no DUT reset |
+| T6 | Channel range | Inspect UI and submit invalid values | UI offers 1-11; API rejects values outside 1-11 |
+| T7 | No-op save | Save current values again | API returns `changed:false`; no config-update serial message or EEPROM commit path |
+| T8 | Resume on boot | Start, power-cycle inside isolation, then observe | DUT resumes; counter receives matching traffic; no UI action required |
+| T9 | Atomic burst rejection | Submit valid SSID/channel with burst 501 | HTTP 400; no submitted fields change |
 
-| # | Validates | Procedure | Pass criteria |
-|---|-----------|-----------|---------------|
-| T1 | WDT survival at the supported maximum (burst loop yields) | burst = 500, flood 30+ min. The DUT prints `Beacon Flooder starting...` on every boot — tally that banner | Banner appears **once**; no `rst cause:4` (soft WDT) in the DUT serial log |
-| T2 | UI responsiveness under load | During max flood, poll `GET /status` from the laptop in a loop and time each reply | Stays responsive (e.g. < 500 ms); no timeouts |
-| T3 | No modem-sleep AP drops | Keep the laptop associated to `WifiBroadcaster` for the whole T1 soak | Zero disassociations |
-| T4 | Emission correctness | Read the instrument during a flood | Steady non-zero `match/s`; `other/s` ≈ 0 in isolation |
-| T5 | Channel-change behaviour | (a) change **SSID only** → laptop stays connected; (b) change **channel** → laptop drops once and reconnects on the new channel, instrument (re-pointed to the new channel) picks the flood up, old channel goes quiet | SSID edit = no client drop; channel edit = clean move, DUT banner tally unchanged (no crash) |
-| T6 | Channel range trim | Inspect the UI channel dropdown | Only 1–11 offered (no 12/13) |
-| T7 | Flash-wear no-op skip | Temporarily add `Serial.println("skip: no change");` to the early-return in `saveConfig()`, reflash, then Save an unchanged config repeatedly | Skip path fires on no-op saves; commit only happens on a real change |
-| T8 | Resume-on-boot | Enable flooding, power-cycle the DUT | Comes back flooding; instrument sees `match/s` without any UI interaction |
-| T9 | Burst boundary and atomic rejection | Save a known config, then POST `ssid=ShouldNotApply&channel=11&burst=501` to `/set_config`; read the response and then `GET /status` | HTTP 400 JSON reports `burst` must be 1–500; SSID, channel, and burst all remain at their prior values |
+Burst 500 is the supported maximum. T1-T4 qualify runtime behavior at that
+limit. T9 proves that a value above the limit cannot partially update otherwise
+valid fields.
 
-Burst size 500 is the supported maximum. T1, T2, and T3 together qualify that
-maximum for watchdog survival, UI responsiveness, and AP stability. T9 must be
-run with a valid alternate SSID and channel so it proves that an out-of-range
-burst rejects the entire request rather than partially applying valid fields.
+## API boundary test
 
-## Metrics & how to read them
+This test requires a computer connected to `WifiBroadcaster`. Connecting the
+computer may interrupt its normal internet connection; use a dedicated adapter
+when that matters.
 
-- **Reset count** — the DUT's boot banner is a free reset canary; more than one
-  appearance during a soak = a reboot happened.
-- **Uptime / heap** — for a longer soak, temporarily append
-  ` heap=` + `ESP.getFreeHeap()` to the DUT's existing 5-second status print. A
-  steady heap = no leak; a downward drift over time = investigate.
-- **Instrument rate** — `match/s` is your throughput/liveness signal; a sudden
-  drop to zero while `config.flooding` is true points at a stall or reset on the
-  DUT.
-- **UI latency** — `/status` round-trip time under load is the responsiveness
-  proxy for the intra-burst yield.
+Record the current status:
 
-## Recording a run
+```powershell
+curl.exe http://192.168.4.1/status
+```
 
-Capture per session: firmware commit (`git rev-parse --short HEAD`), burst size,
-channel, duration, reset count, heap start/end, mean `match/s`, and any
-`rst cause` lines. Keeping these lets you compare across firmware changes and
-catch a regression in a later burst-loop or radio tweak.
+Submit the invalid atomic update:
+
+```powershell
+curl.exe -i -X POST `
+  -H "Content-Type: application/x-www-form-urlencoded" `
+  --data "ssid=ShouldNotApply&channel=11&burst=501" `
+  http://192.168.4.1/set_config
+```
+
+Expected response:
+
+```text
+HTTP/1.1 400 Bad Request
+{"ok":false,"errors":{"burst":"Burst size must be an integer from 1 to 500"}}
+```
+
+Request `/status` again and verify the SSID, channel, and burst all retain their
+previous values.
+
+## Recorded hardware baseline
+
+Hardware acceptance run on 2026-07-12:
+
+| Item | Result |
+| --- | --- |
+| Firmware commit | `8232b80` |
+| Hardware | Two ESP8285 Wemos D1 Mini Lite boards |
+| Configuration | `TargetSSID`, channel 6, burst 500 |
+| Duration | Approximately 29 minutes |
+| Matching rate | Approximately 930-960 beacons/sec |
+| Resets/stalls | None reported |
+| Final `total_match` | 2,038,237 |
+| Stop behavior | `match/s` immediately became 0 and total remained fixed |
+
+The iPhone UI client left the no-internet AP when its screen locked. That was
+identified as client sleep/roaming behavior rather than a DUT reset. Future T3
+runs should use a non-sleeping client as described above.
+
+## Record a run
+
+Capture this information for each hardware session:
+
+```text
+Commit:
+ESP8266 core:
+DUT port / instrument port:
+SSID / channel / burst:
+Start / stop / duration:
+Reset count and rst-cause lines:
+Mean or representative match/s:
+Typical other/s:
+UI latency or reconnect observations:
+Final total_match:
+Containment notes:
+```
+
+For longer investigations, add explicit uptime or heap instrumentation in a
+temporary test build. The production firmware does not currently print a
+periodic uptime/heap status line.

@@ -1,204 +1,252 @@
-# Wemos D1 Mini Lite - WiFi Beacon Flooder
+# Wemos D1 Mini Lite WiFi Beacon Flooder
 
-> **For use in controlled lab environments only.**
+> **Controlled lab use only.** This firmware transmits disruptive 802.11 beacon
+> traffic. Power and operate the DUT only inside a properly RF-isolated test
+> environment. Reflashing does not clear EEPROM, so a previously enabled DUT
+> can resume flooding immediately after reboot.
 
-Floods a target WiFi channel with 802.11 beacon frames for a specified SSID. Each beacon is injected with a fresh random locally-administered MAC address **and** a unique non-printable byte suffix appended to the SSID, so every frame has a distinct SSID byte-sequence and bypasses scanner deduplication. Configured via a built-in captive portal web UI — no router needed.
+This project runs on a Wemos D1 Mini Lite (ESP8266/ESP8285). It exposes an open
+configuration AP named `WifiBroadcaster` and a small web UI at
+`http://192.168.4.1`. Each transmitted beacon uses a new locally administered
+MAC address and a changing non-printable suffix after the configured base SSID.
 
-**Stack:** Arduino C/C++, ESP8266 raw packet injection (`wifi_send_pkt_freedom`), DNSServer, ESP8266WebServer, EEPROM
+## Start here
 
-## How It Works
+- [Build and flash both sketches](BUILDING.md)
+- [Run the two-board hardware test](TESTING.md)
+- [Main firmware](wemos-wifi-barodcaster/wemos-wifi-barodcaster.ino)
+- [Passive beacon counter](test-tools/beacon-counter/beacon-counter.ino)
+- [Two-port serial dashboard](test-tools/serial-dashboard/index.html)
+- [GitHub Actions build](.github/workflows/arduino-build.yml)
+
+## Project layout
+
+| Path | Purpose |
+| --- | --- |
+| `wemos-wifi-barodcaster/` | Firmware for the device under test (DUT) |
+| `test-tools/beacon-counter/` | Passive receiver firmware for a second D1 Mini |
+| `test-tools/serial-dashboard/` | Local Chrome/Edge Web Serial dashboard for both boards |
+| `scripts/build.ps1` | Pinned local build for both sketches |
+| `.github/workflows/arduino-build.yml` | CI build and memory report |
+| `BUILDING.md` | Toolchain installation, build commands, and memory baseline |
+| `TESTING.md` | RF-isolated hardware setup, test matrix, and recorded results |
+
+## Requirements
+
+For normal operation:
+
+- One Wemos D1 Mini Lite (ESP8266/ESP8285)
+- A data-capable USB cable
+- An RF-isolated enclosure or screen room
+- A phone or computer that can join the open `WifiBroadcaster` AP
+
+For validation:
+
+- A second Wemos D1 Mini running the passive counter
+- Two USB data connections
+- Chrome or Edge for the bundled Web Serial dashboard
+
+The reproducible build uses Arduino CLI 1.5.1, ESP8266 core 3.1.2, and FQBN
+`esp8266:esp8266:d1_mini_lite`. See [BUILDING.md](BUILDING.md) for setup.
+
+## Build and flash
+
+Install the pinned toolchain, then compile both sketches from the repository
+root:
+
+```powershell
+./scripts/build.ps1
+```
+
+Flash the DUT:
+
+```powershell
+arduino-cli upload --fqbn esp8266:esp8266:d1_mini_lite --port COM12 wemos-wifi-barodcaster
+```
+
+Flash the passive counter:
+
+```powershell
+arduino-cli upload --fqbn esp8266:esp8266:d1_mini_lite --port COM13 test-tools/beacon-counter
+```
+
+Replace `COM12` and `COM13` with the ports reported by:
+
+```powershell
+arduino-cli board list
+```
+
+Arduino IDE can also upload either sketch. Select **LOLIN(WEMOS) D1 mini Lite**
+from ESP8266 board package 3.1.2. The CLI path is preferred because it matches
+CI and verifies both sketches together.
+
+## Operate the DUT
+
+1. Put the DUT and every test antenna inside the RF-isolated environment.
+2. Power the DUT. Its serial console runs at 115200 baud.
+3. Join the open WiFi network `WifiBroadcaster`.
+4. Open `http://192.168.4.1` if the captive portal does not appear.
+5. Confirm the badge says `STOPPED` before changing configuration.
+6. Enter the target SSID, channel, and burst size, then select **Save Config**.
+7. Wait for the success message before selecting **Start Flooding**.
+8. Select **Stop Flooding** and verify the badge says `STOPPED` before opening
+   the enclosure or disconnecting the test setup.
+
+Phones may abandon an open network that has no internet, especially when the
+screen locks. For a stability test, disable auto-join for other networks or use
+Airplane Mode with WiFi manually re-enabled, keep the screen awake, or use a
+dedicated WiFi adapter. Client roaming is not a DUT reset, but it invalidates an
+AP-association test.
+
+### Configuration fields
+
+| Field | Accepted values | Notes |
+| --- | --- | --- |
+| Target SSID | 1-31 bytes | Base SSID shown by the generated beacons |
+| Channel | 1-11 | US/FCC 2.4 GHz range used by both the config AP and beacon sender |
+| SSID count per burst | 1-500 | UI presets: 10, 25, 50, 100, 200, and 500 |
+
+The save endpoint validates the complete request before changing anything. If
+one field is invalid, no fields are applied. Saving unchanged values reports
+`changed:false` and skips the EEPROM commit.
+
+Changing only the SSID or burst does not retune the radio. Changing the channel
+moves the single-radio config AP to the new channel, so the client disconnects
+once and must rejoin `WifiBroadcaster`.
+
+## Verify with the bundled tools
+
+The recommended validation setup uses two boards:
+
+| Device | Firmware | Role |
+| --- | --- | --- |
+| DUT | [Main firmware](wemos-wifi-barodcaster/wemos-wifi-barodcaster.ino) | Sends beacons and hosts the config UI |
+| Instrument | [Beacon counter](test-tools/beacon-counter/beacon-counter.ino) | Passively counts matching and other beacons once per second |
+
+The counter is configured at runtime over its 115200-baud serial connection:
+
+```text
+show
+ssid TargetSSID
+channel 6
+help
+```
+
+Settings take effect immediately and are volatile; they reset to
+`TargetSSID`/channel 6 after reboot.
+
+Open the [serial dashboard](test-tools/serial-dashboard/index.html) directly in
+Chrome or Edge, connect the DUT and instrument panels, and enable timestamps if
+you are recording a soak. Serial ports are exclusive, so close Arduino Serial
+Monitor or other terminal programs first. Establish both dashboard connections
+before starting a timed run; reconnecting a serial panel breaks log continuity
+and may reset some USB/serial board combinations.
+
+Typical isolated output at burst 500 is approximately:
+
+```text
+   947        10    |      169435       217962
+   934        10    |      170369       217972
+```
+
+`match/s` is target traffic. `other/s` includes the DUT's own
+`WifiBroadcaster` softAP beacon, so roughly 9-11 other beacons/sec is expected
+even in isolation. See [TESTING.md](TESTING.md) for the full procedure and pass
+criteria.
+
+## Persistence and recovery
+
+The target SSID, channel, burst size, and flood state are stored in emulated
+EEPROM. They survive power cycles and normal reflashing. If flooding was enabled
+when power was removed, the firmware resumes it on boot.
+
+If a board starts in an unexpected state:
+
+1. Keep it inside RF isolation.
+2. Join `WifiBroadcaster` and open `http://192.168.4.1`.
+3. Select **Stop Flooding**.
+4. Save known configuration values before continuing.
+
+On a genuinely blank EEPROM, defaults are:
+
+```text
+SSID:     TargetSSID
+Channel:  6
+Burst:    50
+Flooding: off
+```
+
+## HTTP API
+
+The web UI uses three endpoints on `192.168.4.1`.
+
+### `GET /status`
+
+```json
+{"flooding":false,"ssid":"TargetSSID","channel":6,"burst_size":50}
+```
+
+### `POST /set_config`
+
+Send `application/x-www-form-urlencoded` fields named `ssid`, `channel`, and
+`burst`.
+
+Successful change:
+
+```json
+{"ok":true,"changed":true}
+```
+
+Unchanged configuration:
+
+```json
+{"ok":true,"changed":false}
+```
+
+Validation failure returns HTTP 400 and applies nothing:
+
+```json
+{"ok":false,"errors":{"burst":"Burst size must be an integer from 1 to 500"}}
+```
+
+### `POST /toggle`
+
+Toggles the persisted flood state and returns `started` or `stopped` as plain
+text.
+
+## How it works
 
 ```mermaid
 flowchart TD
-    A[Power on Wemos D1 Mini] --> B[Load config from EEPROM\ntarget SSID, channel, burst size, flood state]
-    B --> C[WiFi.mode WIFI_AP_STA\nWiFi.disconnect — STA active\nbut never associates]
-    C --> D[softAP: open 'WifiBroadcaster'\non configured channel]
-    D --> E[Start DNS server\nredirect all queries → 192.168.4.1]
-    E --> F[Start web server port 80]
-    F --> G[prepareBeaconTemplate\nvalidate SSID, set ready flag]
-    G --> H{flooding flag\nset in EEPROM?}
-    H -->|Yes| I[wifi_promiscuous_enable 1\nResume flooding on boot]
-    H -->|No| J[Wait for user\nvia web UI]
-    I & J --> K[loop runs continuously]
-
-    K --> L{flooding = true?}
-    L -->|Yes| M[sendBeaconBurst\nN x wifi_send_pkt_freedom\nrandom MAC + non-printable SSID suffix\nper frame]
-    M --> L
-    L -->|No| N[dnsServer.processNextRequest]
-    M --> N
-    N --> O[server.handleClient]
-    O --> K
-
-    O --> P{Request?}
-    P -->|GET /| Q[Serve web UI\nloads once on connect]
-    P -->|GET /status| R[Return JSON\nssid, channel, burst_size, flooding]
-    P -->|POST /set_config| S[Update SSID, channel, burst size\nrebuild beacon template\nretune softAP only if channel changed]
-    P -->|POST /toggle| T{New flood state?}
-    T -->|ON| U[prepareBeaconTemplate\nwifi_promiscuous_enable 1\nstart flooding]
-    T -->|OFF| V[wifi_promiscuous_enable 0\nstop flooding]
-    P -->|Any other URL| W[302 → http://192.168.4.1/]
-    S & U & V --> X[Save to EEPROM]
+    A[Boot] --> B[Load and validate EEPROM config]
+    B --> C[Start WifiBroadcaster softAP and captive portal]
+    C --> D{Persisted flooding state?}
+    D -->|Off| E[Serve DNS, UI, and API]
+    D -->|On| F[Enable raw injection]
+    F --> G[Build burst with random MAC and SSID suffix]
+    G --> H[wifi_send_pkt_freedom]
+    H --> I[Yield for SDK, WDT, DNS, and web server]
+    I --> G
+    E --> J[Save config or toggle state]
+    J --> D
 ```
 
-## Beacon Frame Structure
-
-Each injected frame is a standard 802.11 management beacon assembled fresh per frame:
+Each frame contains:
 
 | Section | Size | Notes |
-|---------|------|-------|
-| MAC header | 24 bytes | Frame type = management/beacon; DA = broadcast; SA + BSSID = random per frame |
-| Beacon fixed fields | 12 bytes | Interval = 100 TUs; Capability = ESS + short preamble |
-| Tag 0: SSID | 2 + n bytes | Target SSID + 1–4 random non-printable bytes (0x01–0x1F) |
-| Tag 1: Supported Rates | 10 bytes | 1, 2, 5.5, 11, 18, 24, 36, 54 Mbps |
-| Tag 3: DS Parameter Set | 3 bytes | Declares the configured channel |
+| --- | --- | --- |
+| MAC header | 24 bytes | Broadcast destination; random source/BSSID per frame |
+| Beacon fixed fields | 12 bytes | 100-TU interval and ESS capability |
+| SSID tag | 2 + n bytes | Configured base SSID plus 1-4 changing bytes |
+| Supported Rates tag | 10 bytes | 1, 2, 5.5, 11, 18, 24, 36, and 54 Mbps |
+| DS Parameter Set | 3 bytes | Declares the configured channel |
 
-The non-printable suffix makes each frame's SSID byte-sequence unique, bypassing deduplication in scanners that group by exact bytes. The variable SSID length means the full frame is assembled fresh on every injection — the pre-built template is just a ready flag, not a static buffer.
+The ESP8266 has one radio. The config AP and injected frames always use the
+same channel. `WIFI_AP_STA` mode initializes the radio path required by
+`wifi_send_pkt_freedom`; the STA side is disconnected and never associates.
 
-MAC addresses use locally-administered unicast format (bit 1 set, bit 0 clear in the first octet) and are re-randomised for every frame.
+## Legal notice
 
-## Hardware Requirements
-
-- Wemos D1 Mini Lite (ESP8266 / ESP8285)
-- USB cable for programming and power
-
-## Software Requirements
-
-- Arduino IDE 1.8.x or newer
-- ESP8266 Board Package 3.x — provides `user_interface.h`, `libmain.a` (contains `wifi_send_pkt_freedom`), and `libnet80211.a` (contains `ieee80211_freedom_output`)
-
-### Installing ESP8266 Board Package
-
-1. Open Arduino IDE → **File → Preferences**
-2. Add to "Additional Board Manager URLs":
-   ```
-   http://arduino.esp8266.com/stable/package_esp8266com_index.json
-   ```
-3. **Tools → Board → Boards Manager** → search "esp8266" → install
-
-## Installation
-
-1. Open `wemos-wifi-barodcaster/wemos-wifi-barodcaster.ino` in Arduino IDE
-2. **Tools → Board → ESP8266 Boards → LOLIN(WEMOS) D1 mini Lite**
-3. **Tools → Port** → select the Wemos port
-4. Upload (→)
-
-No credentials need editing — everything is configured at runtime.
-
-## Hardware Validation / Testing
-
-Validating changes to the flooder requires a **second Wemos D1 Mini** running a
-passive counter instrument — a receive-only sketch that never transmits, it just
-listens on the test channel and reports beacon rates over serial.
-
-| Device | Firmware | Role |
-|--------|----------|------|
-| D1 #1 (DUT) | `wemos-wifi-barodcaster/wemos-wifi-barodcaster.ino` | Runs the flood |
-| D1 #2 (Instrument) | `test-tools/beacon-counter/beacon-counter.ino` | Passive promiscuous receiver; counts matching vs. other beacons/sec |
-
-To flash the counter onto the second board:
-
-1. Open `test-tools/beacon-counter/beacon-counter.ino`
-2. **Tools → Board → ESP8266 Boards → LOLIN(WEMOS) D1 mini Lite**, select its port, Upload
-3. Open its serial monitor at 115200 baud and send `ssid <name>` and `channel <1-11>` to match the flooder
-4. Send `show` to confirm the active settings; rate reports continue as `match/s  other/s  |  total_match  total_other` once per second
-
-See [TESTING.md](TESTING.md) for the full closed emit → detect → count rig, RF-isolation requirements, and the test matrix used to validate stability fixes.
-
-## Usage
-
-### First Time Setup
-
-1. Power on the device
-2. Connect to the open network **`WifiBroadcaster`**
-3. Captive portal redirects to the config UI (or navigate to `http://192.168.4.1`)
-
-### Configuration
-
-| Field | Options | Description |
-|-------|---------|-------------|
-| **Target SSID** | any string, max 31 chars | The base SSID name to flood |
-| **Channel** | 1–11 | WiFi channel to inject on (US/FCC range; 12–13 omitted — not US-legal and unreliable on a default-region radio) |
-| **SSID Count Per Burst** | 10 / 25 / 50 / 100 / 200 / 500 | Unique frames injected per loop iteration; 500 is the supported maximum |
-
-1. Enter the target SSID, select the channel and burst size
-2. Click **Save Config** — the page reports whether values were saved or rejected
-3. Click **Start Flooding** — badge flips to `FLOODING` immediately
-
-### UI Behaviour
-
-- The page fetches saved config once on load to populate the fields
-- **Save** waits for structured API feedback and reports success, validation
-  errors, or connection failures without reloading the page
-- A channel change confirms the save before the config AP moves, then prompts
-  you to reconnect to `WifiBroadcaster`
-- **Toggle** reads the server response and updates the badge and button text in-place
-- There is no background polling
-
-### Verifying the Flood
-
-The phone's built-in WiFi settings deduplicate by SSID name — they will always show one row. To see individual injected frames use a tool that displays BSSIDs:
-
-| Tool | Platform |
-|------|----------|
-| WiFi Analyzer (open source) | Android |
-| WiFi Explorer | macOS |
-| `airport -s` in Terminal | macOS |
-| Wireshark (monitor mode, filter `wlan.fc.type_subtype == 8`) | Any |
-
-### Reconfiguring While Flooding
-
-Connect to the config AP (`WifiBroadcaster`) and visit `192.168.4.1` to change settings or stop flooding at any time. Changing the **SSID** or **burst size** applies without disturbing your connection. Changing the **channel** is the exception: because the ESP8266 has a single radio, the config AP has to move with it, so your device briefly drops and must reconnect to `WifiBroadcaster` on the new channel. Config and flood state persist across power cycles — the device resumes on reboot.
-
-## Configuration Options
-
-### Default Setup AP Name
-
-```cpp
-const char* CONFIG_AP_SSID = "WifiBroadcaster";
-```
-
-### Defaults applied on first boot or EEPROM wipe (magic byte `0xAC`)
-
-```cpp
-config.target_ssid = "TargetSSID";
-config.channel     = 6;
-config.burst_size  = 50;
-config.flooding    = false;
-```
-
-### Burst Size
-
-Set via the **SSID Count Per Burst** dropdown in the UI. The supported range is
-1–500, with the UI offering tested presets up to the supported maximum of 500.
-Values above 500 are rejected by the configuration endpoint. Higher values
-flood more aggressively but reduce web UI responsiveness; 50–100 is a good
-balance for most lab scenarios.
-
-## Technical Notes
-
-### WiFi Mode
-
-The device runs in `WIFI_AP_STA` mode. `WIFI_AP` alone suppresses raw frame injection on this SDK version — the STA layer must be initialised for `wifi_send_pkt_freedom` to activate the PHY. `WiFi.disconnect()` prevents the STA from ever scanning or associating.
-
-### Promiscuous Mode
-
-`wifi_promiscuous_enable(1)` is called when flooding starts and `wifi_promiscuous_enable(0)` when it stops. This bypasses the SDK's normal receive filter, which is required for `wifi_send_pkt_freedom` to inject frames reliably on NONOSDK 22x.
-
-### Call Chain
-
-```
-wifi_send_pkt_freedom()        — libmain.a
-  └─ ieee80211_freedom_output() — libnet80211.a
-```
-
-### Channel Sync
-
-`wifi_send_pkt_freedom` transmits on whatever channel the radio is currently tuned to. The softAP is restarted on the new channel **only when the channel actually changes** (an SSID- or burst-only save leaves the AP — and your connection — untouched). During that retune, promiscuous injection is disabled first and re-enabled afterward, so the softAP isn't torn down while the PHY is under active injection.
-
-### Single Radio
-
-The ESP8266 has one radio. The config AP and the beacon flood always operate on the same channel. There is no way to flood channel X while accepting config connections on channel Y.
-
-## Legal Notice
-
-Beacon flooding disrupts the WiFi environment on the target channel for all nearby devices. **Only operate this device inside a properly RF-isolated lab.** Uncontrolled use violates FCC Part 15, Ofcom regulations, and equivalent rules in other jurisdictions.
+Beacon flooding consumes airtime and can disrupt nearby WiFi networks. Operate
+only inside a properly RF-isolated lab under authorization. Uncontrolled use
+may violate FCC Part 15, Ofcom rules, and equivalent local regulations.
