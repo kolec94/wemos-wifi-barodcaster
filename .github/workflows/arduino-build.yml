@@ -15,12 +15,19 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Arduino CLI 1.5.1
-        uses: arduino/setup-arduino-cli@7ef629dcdf0f458ab7ae83149d629443deac6eac # v2.0.0
-        with:
-          version: "1.5.1"
+        shell: bash
+        run: |
+          archive=arduino-cli_1.5.1_Linux_64bit.tar.gz
+          curl --fail --silent --show-error --location \
+            --output "/tmp/$archive" \
+            "https://github.com/arduino/arduino-cli/releases/download/v1.5.1/$archive"
+          echo "28a8e119c498a25607821c36cb2dc49e8463941b261a0d99091baa7bc692dd2b  /tmp/$archive" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "/tmp/$archive" --directory /tmp arduino-cli
+          sudo install --mode 0755 /tmp/arduino-cli /usr/local/bin/arduino-cli
 
       - name: Install ESP8266 core 3.1.2
         shell: bash
@@ -37,7 +44,7 @@ jobs:
           Get-Content "$env:RUNNER_TEMP/firmware-memory.md" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Retain memory usage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: firmware-memory-usage
           path: ${{ runner.temp }}/firmware-memory.md
