@@ -27,7 +27,7 @@ extern "C" {
 #define SSID_MAX_LEN      32
 #define BEACON_BUF_SIZE   100
 #define BURST_SIZE_DEFAULT 50   // used only on first boot
-#define BURST_SIZE_MAX    1000  // hard ceiling accepted from the UI
+#define BURST_SIZE_MAX    500   // supported ceiling; matches the UI and soak-test target
 #define CHANNEL_MAX       11    // US (FCC) 2.4 GHz channels; 12/13 are not US-legal
                                 // and don't transmit on a default-region radio
 
@@ -194,10 +194,61 @@ void loadConfig() {
 
 // ----------------------------------------------------- web server --
 
+String jsonEscape(const String& value) {
+  String escaped;
+  escaped.reserve(value.length() + 8);
+
+  for (size_t i = 0; i < value.length(); i++) {
+    uint8_t c = (uint8_t)value[i];
+    switch (c) {
+      case '"': escaped += "\\\""; break;
+      case '\\': escaped += "\\\\"; break;
+      case '\b': escaped += "\\b"; break;
+      case '\f': escaped += "\\f"; break;
+      case '\n': escaped += "\\n"; break;
+      case '\r': escaped += "\\r"; break;
+      case '\t': escaped += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          const char hex[] = "0123456789abcdef";
+          escaped += "\\u00";
+          escaped += hex[c >> 4];
+          escaped += hex[c & 0x0f];
+        } else {
+          escaped += (char)c;
+        }
+    }
+  }
+  return escaped;
+}
+
+bool parseDecimal(const String& value, int& parsed) {
+  if (value.length() == 0) return false;
+  unsigned long result = 0;
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (c < '0' || c > '9') return false;
+    uint8_t digit = c - '0';
+    if (result > (65535UL - digit) / 10) return false;
+    result = result * 10 + digit;
+  }
+  parsed = (int)result;
+  return true;
+}
+
+void addJsonError(String& errors, const char* field, const char* message) {
+  if (errors.length() > 0) errors += ',';
+  errors += '"';
+  errors += jsonEscape(String(field));
+  errors += "\":\"";
+  errors += jsonEscape(String(message));
+  errors += '"';
+}
+
 void handleStatus() {
   String json = "{";
   json += "\"flooding\":"    + String(config.flooding ? "true" : "false") + ",";
-  json += "\"ssid\":\""      + String(config.target_ssid) + "\",";
+  json += "\"ssid\":\""      + jsonEscape(String(config.target_ssid)) + "\",";
   json += "\"channel\":"     + String(config.channel) + ",";
   json += "\"burst_size\":"  + String(config.burst_size);
   json += "}";
@@ -205,35 +256,45 @@ void handleStatus() {
 }
 
 void handleSetConfig() {
-  bool changed = false;
+  Config candidate = config;
+  String errors;
   uint8_t prev_channel = config.channel;
 
   if (server.hasArg("ssid")) {
     String s = server.arg("ssid");
     s.trim();
-    if (s.length() > 0 && s.length() < SSID_MAX_LEN) {
-      s.toCharArray(config.target_ssid, SSID_MAX_LEN);
-      changed = true;
-    }
+    if (s.length() == 0)
+      addJsonError(errors, "ssid", "SSID must not be empty");
+    else if (s.length() >= SSID_MAX_LEN)
+      addJsonError(errors, "ssid", "SSID must be 31 bytes or fewer");
+    else
+      s.toCharArray(candidate.target_ssid, SSID_MAX_LEN);
   }
 
   if (server.hasArg("channel")) {
-    int ch = server.arg("channel").toInt();
-    if (ch >= 1 && ch <= CHANNEL_MAX) {
-      config.channel = (uint8_t)ch;
-      changed = true;
-    }
+    int ch;
+    if (!parseDecimal(server.arg("channel"), ch) || ch < 1 || ch > CHANNEL_MAX)
+      addJsonError(errors, "channel", "Channel must be an integer from 1 to 11");
+    else
+      candidate.channel = (uint8_t)ch;
   }
 
   if (server.hasArg("burst")) {
-    int b = server.arg("burst").toInt();
-    if (b > 0 && b <= BURST_SIZE_MAX) {
-      config.burst_size = (uint16_t)b;
-      changed = true;
-    }
+    int b;
+    if (!parseDecimal(server.arg("burst"), b) || b < 1 || b > BURST_SIZE_MAX)
+      addJsonError(errors, "burst", "Burst size must be an integer from 1 to 500");
+    else
+      candidate.burst_size = (uint16_t)b;
   }
 
+  if (errors.length() > 0) {
+    server.send(400, "application/json", "{\"ok\":false,\"errors\":{" + errors + "}}");
+    return;
+  }
+
+  bool changed = memcmp(&candidate, &config, sizeof(Config)) != 0;
   if (changed) {
+    config = candidate;
     saveConfig();
     prepareBeaconTemplate();
 
@@ -243,7 +304,11 @@ void handleSetConfig() {
     // mode is hammering the PHY can destabilise the radio. The connected client
     // still drops (single radio: the AP has to move to the new channel) and
     // reconnects to WifiBroadcaster on that channel.
+    server.send(200, "application/json", "{\"ok\":true,\"changed\":true}");
+
     if (config.channel != prev_channel) {
+      // Let the success response leave the single radio before moving its AP.
+      delay(150);
       bool was_flooding = config.flooding;
       if (was_flooding) wifi_promiscuous_enable(0);
       WiFi.softAP(CONFIG_AP_SSID, "", config.channel);
@@ -255,7 +320,8 @@ void handleSetConfig() {
                    + "  burst: " + String(config.burst_size));
   }
 
-  server.send(200, "text/plain", "OK");
+  if (!changed)
+    server.send(200, "application/json", "{\"ok\":true,\"changed\":false}");
 }
 
 void handleToggle() {
@@ -312,6 +378,11 @@ void handleRoot() {
     .btn-save   { background: #0f3460; color: #ccc; }
     .btn-toggle { background: #e94560; color: #fff; }
     .btn:hover  { filter: brightness(1.15); }
+    .btn:disabled { cursor: wait; opacity: .65; }
+    .save-status { min-height: 1.2em; margin: 10px 0 4px; font-size: .82rem; }
+    .save-status.success { color: #6ee7a8; }
+    .save-status.error { color: #ff8094; }
+    .save-status.pending { color: #aaa; }
     .hint { font-size: 0.75rem; color: #555; margin-top: 20px; text-align: center; }
   </style>
 </head>
@@ -342,15 +413,25 @@ void handleRoot() {
       <option value="500">500</option>
     </select>
 
-    <button class="btn btn-save"   onclick="saveConfig()">Save Config</button>
+    <button class="btn btn-save" id="saveBtn" onclick="saveConfig()">Save Config</button>
+    <div id="saveStatus" class="save-status" role="status" aria-live="polite"></div>
     <button class="btn btn-toggle" id="toggleBtn" onclick="toggle()">Start Flooding</button>
 
     <div class="hint">Reconnect to <strong>WifiBroadcaster</strong> then visit 192.168.4.1 to reconfigure</div>
   </div>
 
   <script>
+    let savedChannel = null;
+
+    function showSaveStatus(message, state) {
+      const status = document.getElementById('saveStatus');
+      status.textContent = message;
+      status.className = 'save-status ' + state;
+    }
+
     function refresh() {
       fetch('/status').then(r => r.json()).then(d => {
+        savedChannel = String(d.channel);
         // Only update inputs when they don't have focus — prevents overwriting
         // whatever the user is currently typing
         const ssidEl  = document.getElementById('ssid');
@@ -371,15 +452,52 @@ void handleRoot() {
       });
     }
 
-    function saveConfig() {
+    async function saveConfig() {
+      const saveBtn = document.getElementById('saveBtn');
+      const requestedChannel = document.getElementById('channel').value;
+      const channelChanged = savedChannel !== null && requestedChannel !== savedChannel;
       const body = 'ssid='     + encodeURIComponent(document.getElementById('ssid').value.trim())
-                 + '&channel=' + document.getElementById('channel').value
+                 + '&channel=' + requestedChannel
                  + '&burst='   + document.getElementById('burst').value;
-      fetch('/set_config', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body
-      });
+      saveBtn.disabled = true;
+      showSaveStatus(channelChanged
+        ? 'Saving; a channel change will briefly disconnect this device.'
+        : 'Saving configuration...', 'pending');
+
+      try {
+        const response = await fetch('/set_config', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body
+        });
+        let result;
+        try {
+          result = await response.json();
+        } catch (error) {
+          showSaveStatus('Save failed: the device returned an invalid response.', 'error');
+          return;
+        }
+        if (!response.ok || !result.ok) {
+          const messages = result.errors
+            ? Object.values(result.errors)
+            : ['Server rejected the configuration (HTTP ' + response.status + ').'];
+          showSaveStatus(messages.join(' '), 'error');
+          return;
+        }
+
+        savedChannel = requestedChannel;
+        if (channelChanged && result.changed) {
+          showSaveStatus('Saved. Reconnect to WifiBroadcaster on the new channel.', 'success');
+        } else {
+          showSaveStatus(result.changed ? 'Configuration saved.' : 'No changes to save.', 'success');
+        }
+      } catch (error) {
+        showSaveStatus(channelChanged
+          ? 'Connection lost during the channel change. Reconnect to WifiBroadcaster and verify the settings.'
+          : 'Save failed: unable to reach the device.', 'error');
+      } finally {
+        saveBtn.disabled = false;
+      }
     }
 
     function toggle() {

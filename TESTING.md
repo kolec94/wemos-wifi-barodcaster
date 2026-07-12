@@ -38,8 +38,11 @@ counts and invalidate the results.
 ### Instrument setup
 
 1. Open `test-tools/beacon-counter/beacon-counter.ino`.
-2. Set `TARGET_SSID` to the flooder's base SSID and `LISTEN_CHAN` to its channel.
-3. Flash to D1 #2 and open its serial monitor at 115200. It prints one line per
+2. Flash to D1 #2 and open its serial monitor at 115200.
+3. Send `ssid <name>` and `channel <1-11>` to match the flooder's base SSID and
+   channel. Send `show` to confirm the active configuration (`help` lists all
+   commands). Changes are volatile and take effect immediately without reflashing.
+4. The counter prints one line per
    second: `match/s  other/s  |  total_match  total_other`.
 
 The counter matches on the SSID **prefix** (the base name), because the flooder
@@ -62,7 +65,7 @@ Each case targets a specific fix. `match/s` refers to the instrument's output.
 
 | # | Validates | Procedure | Pass criteria |
 |---|-----------|-----------|---------------|
-| T1 | WDT survival (burst loop yields) | burst = 500, flood 30+ min. The DUT prints `Beacon Flooder starting...` on every boot — tally that banner | Banner appears **once**; no `rst cause:4` (soft WDT) in the DUT serial log |
+| T1 | WDT survival at the supported maximum (burst loop yields) | burst = 500, flood 30+ min. The DUT prints `Beacon Flooder starting...` on every boot — tally that banner | Banner appears **once**; no `rst cause:4` (soft WDT) in the DUT serial log |
 | T2 | UI responsiveness under load | During max flood, poll `GET /status` from the laptop in a loop and time each reply | Stays responsive (e.g. < 500 ms); no timeouts |
 | T3 | No modem-sleep AP drops | Keep the laptop associated to `WifiBroadcaster` for the whole T1 soak | Zero disassociations |
 | T4 | Emission correctness | Read the instrument during a flood | Steady non-zero `match/s`; `other/s` ≈ 0 in isolation |
@@ -70,6 +73,12 @@ Each case targets a specific fix. `match/s` refers to the instrument's output.
 | T6 | Channel range trim | Inspect the UI channel dropdown | Only 1–11 offered (no 12/13) |
 | T7 | Flash-wear no-op skip | Temporarily add `Serial.println("skip: no change");` to the early-return in `saveConfig()`, reflash, then Save an unchanged config repeatedly | Skip path fires on no-op saves; commit only happens on a real change |
 | T8 | Resume-on-boot | Enable flooding, power-cycle the DUT | Comes back flooding; instrument sees `match/s` without any UI interaction |
+| T9 | Burst boundary and atomic rejection | Save a known config, then POST `ssid=ShouldNotApply&channel=11&burst=501` to `/set_config`; read the response and then `GET /status` | HTTP 400 JSON reports `burst` must be 1–500; SSID, channel, and burst all remain at their prior values |
+
+Burst size 500 is the supported maximum. T1, T2, and T3 together qualify that
+maximum for watchdog survival, UI responsiveness, and AP stability. T9 must be
+run with a valid alternate SSID and channel so it proves that an out-of-range
+burst rejects the entire request rather than partially applying valid fields.
 
 ## Metrics & how to read them
 

@@ -1,0 +1,44 @@
+name: Arduino build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Arduino CLI 1.5.1
+        uses: arduino/setup-arduino-cli@7ef629dcdf0f458ab7ae83149d629443deac6eac # v2.0.0
+        with:
+          version: "1.5.1"
+
+      - name: Install ESP8266 core 3.1.2
+        shell: bash
+        run: |
+          arduino-cli core update-index \
+            --additional-urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+          arduino-cli core install esp8266:esp8266@3.1.2 \
+            --additional-urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+
+      - name: Compile both sketches
+        shell: pwsh
+        run: |
+          ./scripts/build.ps1 -SummaryPath "$env:RUNNER_TEMP/firmware-memory.md"
+          Get-Content "$env:RUNNER_TEMP/firmware-memory.md" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Retain memory usage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-memory-usage
+          path: ${{ runner.temp }}/firmware-memory.md
+          retention-days: 30

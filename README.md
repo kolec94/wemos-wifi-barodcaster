@@ -98,9 +98,9 @@ listens on the test channel and reports beacon rates over serial.
 To flash the counter onto the second board:
 
 1. Open `test-tools/beacon-counter/beacon-counter.ino`
-2. Set `TARGET_SSID` and `LISTEN_CHAN` to match the flooder's configured SSID and channel
-3. **Tools → Board → ESP8266 Boards → LOLIN(WEMOS) D1 mini Lite**, select its port, Upload
-4. Open its serial monitor at 115200 baud — it prints `match/s  other/s  |  total_match  total_other` once per second
+2. **Tools → Board → ESP8266 Boards → LOLIN(WEMOS) D1 mini Lite**, select its port, Upload
+3. Open its serial monitor at 115200 baud and send `ssid <name>` and `channel <1-11>` to match the flooder
+4. Send `show` to confirm the active settings; rate reports continue as `match/s  other/s  |  total_match  total_other` once per second
 
 See [TESTING.md](TESTING.md) for the full closed emit → detect → count rig, RF-isolation requirements, and the test matrix used to validate stability fixes.
 
@@ -118,16 +118,19 @@ See [TESTING.md](TESTING.md) for the full closed emit → detect → count rig, 
 |-------|---------|-------------|
 | **Target SSID** | any string, max 31 chars | The base SSID name to flood |
 | **Channel** | 1–11 | WiFi channel to inject on (US/FCC range; 12–13 omitted — not US-legal and unreliable on a default-region radio) |
-| **SSID Count Per Burst** | 10 / 25 / 50 / 100 / 200 / 500 | Unique frames injected per loop iteration |
+| **SSID Count Per Burst** | 10 / 25 / 50 / 100 / 200 / 500 | Unique frames injected per loop iteration; 500 is the supported maximum |
 
 1. Enter the target SSID, select the channel and burst size
-2. Click **Save Config** — fires and forgets, inputs stay as-is
+2. Click **Save Config** — the page reports whether values were saved or rejected
 3. Click **Start Flooding** — badge flips to `FLOODING` immediately
 
 ### UI Behaviour
 
 - The page fetches saved config once on load to populate the fields
-- **Save** posts the config silently — no page update, no flicker
+- **Save** waits for structured API feedback and reports success, validation
+  errors, or connection failures without reloading the page
+- A channel change confirms the save before the config AP moves, then prompts
+  you to reconnect to `WifiBroadcaster`
 - **Toggle** reads the server response and updates the badge and button text in-place
 - There is no background polling
 
@@ -165,7 +168,11 @@ config.flooding    = false;
 
 ### Burst Size
 
-Set via the **SSID Count Per Burst** dropdown in the UI. Higher values flood more aggressively but reduce web UI responsiveness. 50–100 is a good balance for most lab scenarios.
+Set via the **SSID Count Per Burst** dropdown in the UI. The supported range is
+1–500, with the UI offering tested presets up to the supported maximum of 500.
+Values above 500 are rejected by the configuration endpoint. Higher values
+flood more aggressively but reduce web UI responsiveness; 50–100 is a good
+balance for most lab scenarios.
 
 ## Technical Notes
 
